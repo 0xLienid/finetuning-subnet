@@ -235,22 +235,8 @@ async def main(config: bt.config):
     model_dir = ft.mining.model_path(config.model_dir, run_id)
     os.makedirs(model_dir, exist_ok=True)
 
-    use_wandb = False
-    if not config.offline:
-        if config.wandb_project is None or config.wandb_entity is None:
-            bt.logging.warning(
-                "Wandb project or entity not specified. This run will not be logged to wandb"
-            )
-        else:
-            use_wandb = True
-
-    block = metagraph.block.item()
     model_parameters = ModelUpdater.get_competition_parameters(
-        block, config.competition_id)
-    if not model_parameters:
-        raise RuntimeError(
-            f"No model parameters found for block {block}"
-        )
+        config.competition_id)
     model_parameters.kwargs["torch_dtype"] = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
     model_parameters.kwargs["attn_implementation"] = config.attn_implementation
 
@@ -264,6 +250,7 @@ async def main(config: bt.config):
         template = tokenizer.chat_template
         template = template + "{{ eos_token }}"
         tokenizer.chat_template = template
+        del template
 
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
@@ -271,36 +258,6 @@ async def main(config: bt.config):
     # Build optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
-    wandb_run = None
-
-    # If using wandb, start a new run.
-    if use_wandb:
-        token = os.getenv("WANDB_API_KEY")
-        if not token:
-            raise ValueError(
-                "To use Wandb, you must set WANDB_API_KEY in your .env file"
-            )
-
-        wandb.login(key=token)
-
-        wandb_run = wandb.init(
-            name=run_id,
-            entity=config.wandb_entity,
-            project=config.wandb_project,
-            config={
-                "uid": my_uid,
-                "hotkey": wallet.hotkey.ss58_address,
-                "run_name": run_id,
-                "version": ft.__version__,
-                "type": "miner",
-            },
-            allow_val_change=True,
-        )
-    else:
-        bt.logging.warning(
-            "Not posting run to wandb. Either --offline is specified or the wandb settings are missing."
-        )
 
     # Start the training loop
     global_step = 0
@@ -343,16 +300,10 @@ async def main(config: bt.config):
             if (i + 1) % accumulation_steps == 0:
                 n_acc_steps += 1
                 optimizer.step()  # Perform a single optimization step
-                scheduler.step()  # Update learning rate
                 optimizer.zero_grad()  # Clear gradients
                 bt.logging.success(
                     f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
                 )
-                if use_wandb:
-                    wandb_run.log(
-                        {"loss": outputs.loss.detach(), "n_batches": n_batches},
-                        step=n_acc_steps,
-                    )
 
             torch.cuda.empty_cache()
 
@@ -363,6 +314,9 @@ async def main(config: bt.config):
         # Calculate the average loss for the epoch
         avg_loss = epoch_loss / n_batches
 
+        # Clear memory
+        del loader, batches, optimizer
+
         # Log the average loss for the epoch
         bt.logging.success(f"Pretraining average loss: {avg_loss}")
 
@@ -372,25 +326,25 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=1000,
+                max_samples=5,
                 steps=1,
                 page_size=1
             )
+            prompts = eval_loader.get_prompts()
             eval_batches = eval_loader.tokenize(tokenizer)
 
             # Compute losses and get responses for local model
             local_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-                model=model.pt_model,
+                model=model,
                 tokenizer=tokenizer,
                 batches=eval_batches,
                 device=config.device
             )
 
             # Load the best model from the network and compute losses
-            best_uid = ft.graph.best_uid(metagraph)
-            best_model, best_tokenizer = await miner_actions.load_remote_model(best_uid, metagraph, config.model_dir)
+            best_model, best_tokenizer = await miner_actions.load_remote_model(config.load_uid, metagraph, config.model_dir)
             best_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-                model=best_model.pt_model,
+                model=best_model,
                 tokenizer=best_tokenizer,
                 batches=eval_batches,
                 device=config.device
@@ -401,34 +355,35 @@ async def main(config: bt.config):
             num_wins = 0
             sum_loss = 0.0
             dpo_dataset = []
-            for result_pair in zip(local_losses_and_outputs, best_losses_and_outputs):
-                local_loss, local_output = result_pair[0]
-                best_loss, best_output = result_pair[1]
-                iswin = ft.validation.iswin(local_loss, best_loss, 1, 0)
-                sum_loss += local_loss
+            for result_pair in zip(local_losses_and_outputs, best_losses_and_outputs, prompts):
+                local = result_pair[0]
+                best = result_pair[1]
+                prompt = result_pair[2]
+                iswin = ft.validation.iswin(local["loss"], best["loss"], 1, 0)
+                sum_loss += local["loss"]
 
                 if iswin:
                     num_wins += 1
                     dpo_dataset.append({
-                        "question": "",
-                        "chosen": local_output,
-                        "rejected": best_output
+                        "question": prompt,
+                        "chosen": local["response"],
+                        "rejected": best["response"]
                     })
                 else:
                     dpo_dataset.append({
-                        "question": "",
-                        "chosen": best_output,
-                        "rejected": local_output
+                        "question": prompt,
+                        "chosen": best["response"],
+                        "rejected": local["response"]
                     })
-
-            # Clear memory
-            del local_losses_and_outputs, best_losses_and_outputs
 
             # Log the win rate and average loss
             bt.logging.success(
                 f"Initial win rate: {num_wins / len(local_losses_and_outputs)}")
             bt.logging.success(
                 f"Initial average loss: {sum_loss / len(local_losses_and_outputs)}")
+
+            # Clear memory
+            del local_losses_and_outputs, best_losses_and_outputs
 
             # Set up DPO training
             prompt_column = [
@@ -453,7 +408,7 @@ async def main(config: bt.config):
                     output_dir=model_dir,
                     per_device_train_batch_size=2,
                     gradient_accumulation_steps=32,
-                    learning_rate=scheduler.get_last_lr() * 1.5,
+                    learning_rate=config.lr * 0.95,
                     num_train_epochs=1,
                 ),
                 beta=0.1,
@@ -482,17 +437,16 @@ async def main(config: bt.config):
 
             # Compute losses for local model
             local_losses = ft.validation.compute_losses(
-                model=model.pt_model,
+                model=model,
                 batches=eval_batches,
                 device=config.device
             )
 
             # Get comparison model and compute losses
-            comparison_uid = my_uid if not config.offline else ft.graph.best_uid(
-                metagraph)
+            comparison_uid = my_uid if not config.offline else config.load_uid
             comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
             comparison_losses = ft.validation.compute_losses(
-                model=comparison_model.pt_model,
+                model=comparison_model,
                 batches=eval_batches,
                 device=config.device
             )
@@ -521,11 +475,8 @@ async def main(config: bt.config):
                 model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
                     model_dir, model_parameters)
                 await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
-
-    finally:
-        # Important step.
-        if wandb_run:
-            wandb_run.finish()
+    except Exception as e:
+        bt.logging.error(f"Failed with error: {e}")
 
 
 if __name__ == "__main__":

@@ -40,8 +40,10 @@ def iswin(loss_i, loss_j, block_i, block_j):
         bool: True if loss i is better, False otherwise.
     """
     # Adjust loss based on timestamp and pretrain epsilon
-    loss_i = (1 - constants.timestamp_epsilon) * loss_i if block_i < block_j else loss_i
-    loss_j = (1 - constants.timestamp_epsilon) * loss_j if block_j < block_i else loss_j
+    loss_i = (1 - constants.timestamp_epsilon) * \
+        loss_i if block_i < block_j else loss_i
+    loss_j = (1 - constants.timestamp_epsilon) * \
+        loss_j if block_j < block_i else loss_j
     return loss_i < loss_j
 
 
@@ -76,10 +78,12 @@ def compute_wins(
             for batch_idx in range(0, min(batches_i, batches_j)):
                 loss_i = losses_per_uid[uid_i][batch_idx]
                 loss_j = losses_per_uid[uid_j][batch_idx]
-                wins[uid_i] += 1 if iswin(loss_i, loss_j, block_i, block_j) else 0
+                wins[uid_i] += 1 if iswin(loss_i,
+                                          loss_j, block_i, block_j) else 0
                 total_matches += 1
         # Calculate win rate for uid i
-        win_rate[uid_i] = wins[uid_i] / total_matches if total_matches > 0 else 0
+        win_rate[uid_i] = wins[uid_i] / \
+            total_matches if total_matches > 0 else 0
 
     return wins, win_rate
 
@@ -107,7 +111,8 @@ def compute_losses(
             try:
                 inputs = inputs.to(device)
                 labels = inputs.clone()
-                labels[:, :prompt_len] = -100 # Only calculate loss on response
+                # Only calculate loss on response
+                labels[:, :prompt_len] = -100
                 outputs = model(inputs, labels=labels)
                 loss = outputs.loss.item()  # Extract scalar loss value
                 losses.append(loss)
@@ -117,6 +122,7 @@ def compute_losses(
                 losses.append(math.inf)  # Use infinity to indicate failure
 
     return losses
+
 
 def compute_losses_with_outputs(
     model, tokenizer, batches: typing.List[typing.Tuple[torch.Tensor, int]], device: str
@@ -142,26 +148,25 @@ def compute_losses_with_outputs(
             try:
                 inputs = inputs.to(device)
                 labels = inputs.clone()
-                labels[:, :prompt_len] = -100 # Only calculate loss on response
+                # Only calculate loss on response
+                labels[:, :prompt_len] = -100
                 outputs = model(inputs, labels=labels)
                 loss = outputs.loss.item()  # Extract scalar loss value
 
                 # Generate response samples
                 prompt = inputs[:, :prompt_len]
-                conversation = [{"role": "user", "content": prompt}]
-                input_ids = tokenizer.apply_chat_template(
-                    conversation, truncation=True, return_tensors="pt",
-                    max_length = constants.sequence_length, add_generation_prompt=True,
-                ).to(device)
-                output = model.generate(input_ids, generation_config=GenerationConfig(
+                output = model.generate(prompt, generation_config=GenerationConfig(
                     max_length=constants.sequence_length, do_sample=True, temperature=0.8,
-                    top_p=0.95 top_k=40, repetition_penalty=1.1,
+                    top_p=0.95, top_k=40, repetition_penalty=1.1,
                     eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id
                 ))
-                response = tokenizer.decode(output[0][len(input_ids[0]):], skip_special_tokens=True)
-                
+                response = tokenizer.decode(
+                    output[0][len(prompt):], skip_special_tokens=True)
+
                 results.append({"loss": loss, "response": response})
             except Exception as e:
                 bt.logging.error(f"Exception occurred: {e}")
                 traceback.print_exc()
                 results.append({"loss": math.inf, "response": "N/A"})
+
+    return results
