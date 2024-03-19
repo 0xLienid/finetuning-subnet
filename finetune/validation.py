@@ -162,6 +162,7 @@ def compute_losses_with_outputs(
                 ))
                 response = tokenizer.decode(
                     output[0][len(prompt):], skip_special_tokens=True)
+                print(response)
 
                 results.append({"loss": loss, "response": response})
             except Exception as e:

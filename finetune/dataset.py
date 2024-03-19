@@ -216,6 +216,12 @@ UNWANTED_PHRASES = [
 ]
 
 
+def is_valid_response(response: str) -> bool:
+    if not (response.rstrip().endswith(".") or response.rstrip().endswith("?") or response.rstrip().endswith("!")) or any(x in response for x in UNWANTED_PHRASES):
+        return False
+    return True
+
+
 class CortexSubsetLoader(IterableDataset):
     def __init__(self, latest=True, random_seed: typing.Optional[int] = None,
                  max_samples=300, steps: typing.Optional[int] = 1, progress=False,
@@ -274,7 +280,7 @@ class CortexSubsetLoader(IterableDataset):
                                         prompt = prompt.strip()
                                         response = response.strip()
                                         if len(prompt) > 0 and len(response) > 0:
-                                            if not any(x in response for x in UNWANTED_PHRASES):
+                                            if is_valid_response(response):
                                                 self.buffer.append(
                                                     (prompt, response))
                                                 if len(self.buffer) == max_samples:

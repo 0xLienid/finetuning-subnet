@@ -36,6 +36,7 @@ from trl import DPOTrainer
 from finetune.mining import Actions
 from utilities import utils
 import datetime as dt
+import pandas as pd
 
 from dotenv import load_dotenv
 
@@ -396,7 +397,8 @@ async def main(config: bt.config):
                     add_generation_prompt=True
                 )
                 for sample in dpo_dataset]
-            self_play_dataset = Dataset.from_dict(dpo_dataset)
+            self_play_dataset = Dataset.from_pandas(
+                pd.DataFrame(data=dpo_dataset))
             self_play_dataset = self_play_dataset.add_column(
                 "prompt", prompt_column)
 
