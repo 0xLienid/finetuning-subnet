@@ -24,6 +24,7 @@ import typing
 import constants
 import traceback
 import bittensor as bt
+from transformers import GenerationConfig
 
 
 def iswin(loss_i, loss_j, block_i, block_j):
@@ -116,3 +117,51 @@ def compute_losses(
                 losses.append(math.inf)  # Use infinity to indicate failure
 
     return losses
+
+def compute_losses_with_outputs(
+    model, tokenizer, batches: typing.List[typing.Tuple[torch.Tensor, int]], device: str
+) -> typing.List[float]:
+    """
+    Computes the losses for a given model on provided batches and reports generated
+    response samples for each batch. Used to attempt DPO against the best available model.
+
+    Parameters:
+        model (torch.nn.Module): The model for which losses are to be computed.
+        batches (dict): A list of batches and associated lengths of the "prompt" section
+        device (str): The device to use for computation (e.g. 'cpu', 'gpu')
+
+        Returns:
+            dict: A dictionary with page indices as keys and lists of tuples (loss value, generated output) as values
+    """
+    # Iterate over each batch
+    results = []
+    with torch.inference_mode():
+        model.to(device)
+        model.eval()
+        for inputs, prompt_len in batches:
+            try:
+                inputs = inputs.to(device)
+                labels = inputs.clone()
+                labels[:, :prompt_len] = -100 # Only calculate loss on response
+                outputs = model(inputs, labels=labels)
+                loss = outputs.loss.item()  # Extract scalar loss value
+
+                # Generate response samples
+                prompt = inputs[:, :prompt_len]
+                conversation = [{"role": "user", "content": prompt}]
+                input_ids = tokenizer.apply_chat_template(
+                    conversation, truncation=True, return_tensors="pt",
+                    max_length = constants.sequence_length, add_generation_prompt=True,
+                ).to(device)
+                output = model.generate(input_ids, generation_config=GenerationConfig(
+                    max_length=constants.sequence_length, do_sample=True, temperature=0.8,
+                    top_p=0.95 top_k=40, repetition_penalty=1.1,
+                    eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id
+                ))
+                response = tokenizer.decode(output[0][len(input_ids[0]):], skip_special_tokens=True)
+                
+                results.append({"loss": loss, "response": response})
+            except Exception as e:
+                bt.logging.error(f"Exception occurred: {e}")
+                traceback.print_exc()
+                results.append({"loss": math.inf, "response": "N/A"})

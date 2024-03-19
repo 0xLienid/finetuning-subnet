@@ -4,6 +4,7 @@ from huggingface_hub import HfApi
 from model.data import Model, ModelId
 from model.storage.disk import utils
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import update_repo_visibility
 from constants import CompetitionParameters, MAX_HUGGING_FACE_BYTES
 
 from model.storage.remote_model_store import RemoteModelStore
@@ -17,7 +18,8 @@ class HuggingFaceModelStore(RemoteModelStore):
     def assert_access_token_exists(cls) -> str:
         """Asserts that the access token exists."""
         if not os.getenv("HF_ACCESS_TOKEN"):
-            raise ValueError("No Hugging Face access token found to write to the hub.")
+            raise ValueError(
+                "No Hugging Face access token found to write to the hub.")
         return os.getenv("HF_ACCESS_TOKEN")
 
     async def upload_model(self, model: Model, competition_parameters: CompetitionParameters) -> ModelId:
@@ -28,12 +30,14 @@ class HuggingFaceModelStore(RemoteModelStore):
         model.tokenizer.push_to_hub(
             repo_id=model.id.namespace + "/" + model.id.name,
             token=token,
+            use_auth_token=token
         )
 
         commit_info = model.pt_model.push_to_hub(
             repo_id=model.id.namespace + "/" + model.id.name,
             token=token,
             safe_serialization=True,
+            use_auth_token=token
         )
 
         model_id_with_commit = ModelId(
@@ -54,7 +58,8 @@ class HuggingFaceModelStore(RemoteModelStore):
     async def download_model(self, model_id: ModelId, local_path: str, model_parameters: CompetitionParameters) -> Model:
         """Retrieves a trained model from Hugging Face."""
         if not model_id.commit:
-            raise ValueError("No Hugging Face commit id found to read from the hub.")
+            raise ValueError(
+                "No Hugging Face commit id found to read from the hub.")
 
         repo_id = model_id.namespace + "/" + model_id.name
 
@@ -102,3 +107,12 @@ class HuggingFaceModelStore(RemoteModelStore):
         )
 
         return Model(id=model_id_with_hash, pt_model=model, tokenizer=tokenizer)
+
+    def make_repo_public(self, repo_id: str):
+        """Makes a Hugging Face repository public."""
+        token = HuggingFaceModelStore.assert_access_token_exists()
+        update_repo_visibility(
+            repo_id=repo_id,
+            private=False,
+            token=token
+        )

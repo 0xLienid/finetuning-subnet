@@ -9,6 +9,8 @@ rich
 safetensors
 torch
 transformers==4.38.1
+trl
+datasets
 wandb
 sentencepiece
 jinja2>=3.0.0

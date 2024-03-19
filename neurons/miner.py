@@ -30,7 +30,9 @@ from model.storage.chain.chain_model_metadata_store import ChainModelMetadataSto
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
 import finetune as ft
 import bittensor as bt
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments
+from datasets import Dataset
+from trl import DPOTrainer
 from finetune.mining import Actions
 from utilities import utils
 import datetime as dt
@@ -65,7 +67,8 @@ def get_config():
     parser.add_argument(
         "--wandb_project", type=str, help="The wandb project to log to."
     )
-    parser.add_argument("--wandb_entity", type=str, help="The wandb entity to log to.")
+    parser.add_argument("--wandb_entity", type=str,
+                        help="The wandb entity to log to.")
     parser.add_argument(
         "--hf_repo_id",
         type=str,
@@ -111,7 +114,8 @@ def get_config():
         default=-1,
         help="Number of training epochs (-1 is infinite)",
     )
-    parser.add_argument("--lr", type=float, default=0.00001, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=0.00001,
+                        help="Learning rate.")
     parser.add_argument(
         "--accumulation_steps",
         type=int,
@@ -127,7 +131,7 @@ def get_config():
     parser.add_argument(
         "--cortex_samples_per_epoch",
         type=int,
-        default=4096,
+        default=1024,
         help="Number of samples trained on per epoch",
     )
     parser.add_argument(
@@ -199,11 +203,15 @@ async def load_starting_model(
 
     # Check if we should load a model from a local directory.
     if config.load_model_dir:
-        model, tokenizer = actions.load_local_model(config.load_model_dir, model_parameters)
-        bt.logging.success(f"Training with model from disk. Model={str(model)}")
+        model, tokenizer = actions.load_local_model(
+            config.load_model_dir, model_parameters)
+        bt.logging.success(
+            f"Training with model from disk. Model={str(model)}")
         return model, tokenizer
 
-    raise RuntimeError("No starting model specified, pass either --load_best, --load_uid, or --load_model_dir")
+    raise RuntimeError(
+        "No starting model specified, pass either --load_best, --load_uid, or --load_model_dir")
+
 
 async def main(config: bt.config):
     # Create bittensor objects.
@@ -237,7 +245,8 @@ async def main(config: bt.config):
             use_wandb = True
 
     block = metagraph.block.item()
-    model_parameters = ModelUpdater.get_competition_parameters(block, config.competition_id)
+    model_parameters = ModelUpdater.get_competition_parameters(
+        block, config.competition_id)
     if not model_parameters:
         raise RuntimeError(
             f"No model parameters found for block {block}"
@@ -250,11 +259,19 @@ async def main(config: bt.config):
     model = model.train()
     model = model.to(config.device)
 
+    # Adjust chat template
+    if not tokenizer.chat_template.endswith("{{ eos_token }}"):
+        template = tokenizer.chat_template
+        template = template + "{{ eos_token }}"
+        tokenizer.chat_template = template
+
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
 
     # Build optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
     wandb_run = None
 
     # If using wandb, start a new run.
@@ -286,99 +303,224 @@ async def main(config: bt.config):
         )
 
     # Start the training loop
-    epoch_step = 0
     global_step = 0
     n_acc_steps = 0
-    best_avg_loss = math.inf
     accumulation_steps = config.accumulation_steps
 
     try:
-        while epoch_step < config.num_epochs or config.num_epochs == -1:
-            # Initialize loss accumulator for the epoch
-            epoch_loss = 0.0
+        # Initialize loss accumulator for the epoch
+        epoch_loss = 0.0
 
-            # Prepare the data loader with random pages for each epoch
-            bt.logging.success(
-                f"Loading {config.cortex_samples_per_epoch} pages for training this epoch"
-            )
-            loader = ft.dataset.CortexSubsetLoader(
-                latest=False,
-                random_seed=random.randint(0, 100000000),
-                max_samples=config.cortex_samples_per_epoch,
-                steps=config.cortex_steps,
-                page_size=config.cortex_steps,
-            )
-            batches = loader.tokenize(tokenizer)
+        # Prepare the data loader with random pages for each epoch
+        bt.logging.success(
+            f"Loading {config.cortex_samples_per_epoch} pages for training this epoch"
+        )
+        loader = ft.dataset.CortexSubsetLoader(
+            latest=False,
+            random_seed=random.randint(0, 100000000),
+            max_samples=config.cortex_samples_per_epoch,
+            steps=config.cortex_steps,
+            page_size=config.cortex_steps,
+        )
+        batches = loader.tokenize(tokenizer)
 
-            # Enumerate over the data loader
-            n_batches = 0
-            optimizer.zero_grad()  # Initialize gradients to zero
+        # Enumerate over the data loader
+        n_batches = 0
+        optimizer.zero_grad()  # Initialize gradients to zero
 
-            for i, (batch, _) in enumerate(batches):
-                # Move the input batch to the device
-                inputs = batch.to(model.device)
+        for i, (batch, prompt_len) in enumerate(batches):
+            # Move the input batch to the device
+            inputs = batch.to(model.device)
+            labels = inputs.clone()
+            labels[:, :prompt_len] = -100
 
-                # Forward pass: compute the model output and loss
-                outputs = model(inputs, labels=inputs)
+            # Forward pass: compute the model output and loss
+            outputs = model(inputs, labels=labels)
 
-                loss = outputs.loss / accumulation_steps  # Scale loss
-                loss.backward()  # Accumulate gradients
+            loss = outputs.loss / accumulation_steps  # Scale loss
+            loss.backward()  # Accumulate gradients
 
-                if (i + 1) % accumulation_steps == 0:
-                    n_acc_steps += 1
-                    optimizer.step()  # Perform a single optimization step
-                    optimizer.zero_grad()  # Clear gradients
-                    bt.logging.success(
-                        f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
+            if (i + 1) % accumulation_steps == 0:
+                n_acc_steps += 1
+                optimizer.step()  # Perform a single optimization step
+                scheduler.step()  # Update learning rate
+                optimizer.zero_grad()  # Clear gradients
+                bt.logging.success(
+                    f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
+                )
+                if use_wandb:
+                    wandb_run.log(
+                        {"loss": outputs.loss.detach(), "n_batches": n_batches},
+                        step=n_acc_steps,
                     )
-                    if use_wandb:
-                        wandb_run.log(
-                            {"loss": outputs.loss.detach(), "n_batches": n_batches},
-                            step=n_acc_steps,
-                        )
 
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
-                n_batches += 1
-                global_step += 1
-                epoch_loss += outputs.loss.detach().item()
+            n_batches += 1
+            global_step += 1
+            epoch_loss += outputs.loss.detach().item()
 
-            # Calculate the average loss for the epoch
-            avg_loss = epoch_loss / n_batches
+        # Calculate the average loss for the epoch
+        avg_loss = epoch_loss / n_batches
 
-            # Log the average loss for the epoch
-            bt.logging.success(f"Epoch: {epoch_step} average loss: {avg_loss}")
-            epoch_step += 1
+        # Log the average loss for the epoch
+        bt.logging.success(f"Pretraining average loss: {avg_loss}")
 
-            # Check if the average loss of this epoch is the best we've seen so far
-            if avg_loss < best_avg_loss:
-                best_avg_loss = avg_loss  # Update the best average loss
-
-                bt.logging.success(f"New best average loss: {best_avg_loss}.")
-
-                # Save the model to your mining dir.
-                bt.logging.success(f"Saving model to path: {model_dir}.")
-                miner_actions.save(model, tokenizer, model_dir)
-
-        bt.logging.success("Finished training")
-        # Push the model to your run.
-        if not config.offline:
-            if best_avg_loss < config.avg_loss_upload_threshold:
-                bt.logging.success(
-                    f"Trained model had a best_avg_loss of {best_avg_loss} which is below the threshold of {config.avg_loss_upload_threshold}. Uploading to hugging face. "
-                )
-
-                # First, reload the best model from the training run.
-                model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(model_dir, model_parameters)
-                await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
-            else:
-                bt.logging.success(
-                    f"This training run achieved a best_avg_loss={best_avg_loss}, which did not meet the upload threshold. Not uploading to hugging face."
-                )
-        else:
-            bt.logging.success(
-                "Not uploading to hugging face because --offline was specified."
+        # Self-Play
+        while True:
+            # Load data for head-to-head evaluation against best model
+            eval_loader = ft.dataset.CortexSubsetLoader(
+                latest=True, running=True,
+                random_seed=random.randint(0, 100000000),
+                max_samples=1000,
+                steps=1,
+                page_size=1
             )
+            eval_batches = eval_loader.tokenize(tokenizer)
+
+            # Compute losses and get responses for local model
+            local_losses_and_outputs = ft.validation.compute_losses_with_outputs(
+                model=model.pt_model,
+                tokenizer=tokenizer,
+                batches=eval_batches,
+                device=config.device
+            )
+
+            # Load the best model from the network and compute losses
+            best_uid = ft.graph.best_uid(metagraph)
+            best_model, best_tokenizer = await miner_actions.load_remote_model(best_uid, metagraph, config.model_dir)
+            best_losses_and_outputs = ft.validation.compute_losses_with_outputs(
+                model=best_model.pt_model,
+                tokenizer=best_tokenizer,
+                batches=eval_batches,
+                device=config.device
+            )
+            del best_model, best_tokenizer, eval_loader, eval_batches
+
+            # Compare the losses and build DPO dataset of winning responses
+            num_wins = 0
+            sum_loss = 0.0
+            dpo_dataset = []
+            for result_pair in zip(local_losses_and_outputs, best_losses_and_outputs):
+                local_loss, local_output = result_pair[0]
+                best_loss, best_output = result_pair[1]
+                iswin = ft.validation.iswin(local_loss, best_loss, 1, 0)
+                sum_loss += local_loss
+
+                if iswin:
+                    num_wins += 1
+                    dpo_dataset.append({
+                        "question": "",
+                        "chosen": local_output,
+                        "rejected": best_output
+                    })
+                else:
+                    dpo_dataset.append({
+                        "question": "",
+                        "chosen": best_output,
+                        "rejected": local_output
+                    })
+
+            # Clear memory
+            del local_losses_and_outputs, best_losses_and_outputs
+
+            # Log the win rate and average loss
+            bt.logging.success(
+                f"Initial win rate: {num_wins / len(local_losses_and_outputs)}")
+            bt.logging.success(
+                f"Initial average loss: {sum_loss / len(local_losses_and_outputs)}")
+
+            # Set up DPO training
+            prompt_column = [
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": sample["question"]}],
+                    truncation=True,
+                    return_tensors="pt",
+                    max_length=constants.sequence_length,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                for sample in dpo_dataset]
+            self_play_dataset = Dataset.from_dict(dpo_dataset)
+            self_play_dataset = self_play_dataset.add_column(
+                "prompt", prompt_column)
+
+            # Train the DPO model
+            dpo_trainer = DPOTrainer(
+                model,
+                model,
+                args=TrainingArguments(
+                    output_dir=model_dir,
+                    per_device_train_batch_size=2,
+                    gradient_accumulation_steps=32,
+                    learning_rate=scheduler.get_last_lr() * 1.5,
+                    num_train_epochs=1,
+                ),
+                beta=0.1,
+                train_dataset=self_play_dataset,
+                tokenizer=tokenizer,
+            )
+            dpo_trainer.train()
+
+            # Save model locally
+            miner_actions.save(model, tokenizer, model_dir)
+
+            # Clear memory
+            del self_play_dataset, dpo_trainer
+
+            bt.logging.success("Finished self-play loop")
+
+            # Get final eval dataset
+            eval_loader = ft.dataset.CortexSubsetLoader(
+                latest=True, running=True,
+                random_seed=random.randint(0, 100000000),
+                max_samples=100,
+                steps=1,
+                page_size=1
+            )
+            eval_batches = eval_loader.tokenize(tokenizer)
+
+            # Compute losses for local model
+            local_losses = ft.validation.compute_losses(
+                model=model.pt_model,
+                batches=eval_batches,
+                device=config.device
+            )
+
+            # Get comparison model and compute losses
+            comparison_uid = my_uid if not config.offline else ft.graph.best_uid(
+                metagraph)
+            comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
+            comparison_losses = ft.validation.compute_losses(
+                model=comparison_model.pt_model,
+                batches=eval_batches,
+                device=config.device
+            )
+
+            # Clear memory
+            del eval_loader, eval_batches, comparison_model
+
+            # Calculate win rate
+            num_wins = 0
+            sum_loss = 0.0
+            for result_pair in zip(local_losses, comparison_losses):
+                local_loss = result_pair[0]
+                comparison_loss = result_pair[1]
+                iswin = ft.validation.iswin(local_loss, comparison_loss, 1, 0)
+                sum_loss += local_loss
+
+                if iswin:
+                    num_wins += 1
+
+            bt.logging.success(
+                f"Comparison win rate: {num_wins / len(local_losses)}")
+            bt.logging.success(
+                f"Comparison average loss: {sum_loss / len(local_losses)}")
+
+            if num_wins / len(local_losses) > 0.5 and not config.offline:
+                model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
+                    model_dir, model_parameters)
+                await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
 
     finally:
         # Important step.
