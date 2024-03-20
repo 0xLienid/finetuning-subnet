@@ -451,7 +451,7 @@ async def main(config: bt.config):
             bt.logging.success("Evaluated local model for comparison")
 
             # Get comparison model and compute losses
-            comparison_uid = my_uid if not config.offline else 246
+            comparison_uid = 246
             comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
             comparison_losses = ft.validation.compute_losses(
                 model=comparison_model,
@@ -483,7 +483,7 @@ async def main(config: bt.config):
             bt.logging.success(
                 f"Comparison average loss: {sum_loss / len(local_losses)}")
 
-            if num_wins / len(local_losses) > 0.5 and not config.offline:
+            if not config.offline:
                 model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
                     model_dir, model_parameters)
                 await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
