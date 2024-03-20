@@ -132,7 +132,7 @@ def get_config():
     parser.add_argument(
         "--cortex_samples_per_epoch",
         type=int,
-        default=8192,
+        default=20480,
         help="Number of samples trained on per epoch",
     )
     parser.add_argument(
@@ -259,6 +259,7 @@ async def main(config: bt.config):
     # Build optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # Start the training loop
     global_step = 0
@@ -302,6 +303,7 @@ async def main(config: bt.config):
                 n_acc_steps += 1
                 optimizer.step()  # Perform a single optimization step
                 optimizer.zero_grad()  # Clear gradients
+                scheduler.step()  # Update learning rate
                 bt.logging.success(
                     f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
                 )
@@ -316,7 +318,7 @@ async def main(config: bt.config):
         avg_loss = epoch_loss / n_batches
 
         # Clear memory
-        del loader, batches, optimizer
+        del loader, batches, optimizer, scheduler
 
         # Log the average loss for the epoch
         bt.logging.success(f"Pretraining average loss: {avg_loss}")
@@ -327,7 +329,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=50,
+                max_samples=100,
                 steps=1,
                 page_size=1
             )
