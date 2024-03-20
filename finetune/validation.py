@@ -140,12 +140,16 @@ def compute_losses_with_outputs(
             dict: A dictionary with page indices as keys and lists of tuples (loss value, generated output) as values
     """
     # Iterate over each batch
+    i = 0
     results = []
     with torch.inference_mode():
         model.to(device)
         model.eval()
         for inputs, prompt_len in batches:
             try:
+                print(f"Generating output: {i}")
+                i += 1
+
                 inputs = inputs.to(device)
                 labels = inputs.clone()
                 # Only calculate loss on response
@@ -156,13 +160,15 @@ def compute_losses_with_outputs(
                 # Generate response samples
                 prompt = inputs[:, :prompt_len]
                 output = model.generate(prompt, generation_config=GenerationConfig(
-                    max_length=constants.sequence_length, do_sample=True, temperature=0.8,
+                    max_length=constants.sequence_length, do_sample=True, temperature=1.1,
                     top_p=0.95, top_k=40, repetition_penalty=1.1,
                     eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id
                 ))
                 response = tokenizer.decode(
-                    output[0][len(prompt):], skip_special_tokens=True)
-                print(response)
+                    output[0][:])
+                response_index = response.find("<start_of_turn>model")
+                response = response[response_index +
+                                    len("<start_of_turn>model"):]
 
                 results.append({"loss": loss, "response": response})
             except Exception as e:

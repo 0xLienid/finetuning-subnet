@@ -327,7 +327,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=5,
+                max_samples=100,
                 steps=1,
                 page_size=1
             )
@@ -341,6 +341,7 @@ async def main(config: bt.config):
                 batches=eval_batches,
                 device=config.device
             )
+            bt.logging.success("Local model evaluated")
 
             # Load the best model from the network and compute losses
             best_model, best_tokenizer = await miner_actions.load_remote_model(config.load_uid, metagraph, config.model_dir)
@@ -350,7 +351,8 @@ async def main(config: bt.config):
                 batches=eval_batches,
                 device=config.device
             )
-            del best_model, best_tokenizer, eval_loader, eval_batches
+            bt.logging.success("Best model evaluated")
+            del best_tokenizer, eval_loader, eval_batches
 
             # Compare the losses and build DPO dataset of winning responses
             num_wins = 0
@@ -405,12 +407,12 @@ async def main(config: bt.config):
             # Train the DPO model
             dpo_trainer = DPOTrainer(
                 model,
-                model,
+                best_model,
                 args=TrainingArguments(
                     output_dir=model_dir,
                     per_device_train_batch_size=2,
                     gradient_accumulation_steps=32,
-                    learning_rate=config.lr * 0.95,
+                    learning_rate=2e-10,
                     num_train_epochs=1,
                 ),
                 beta=0.1,
@@ -421,9 +423,10 @@ async def main(config: bt.config):
 
             # Save model locally
             miner_actions.save(model, tokenizer, model_dir)
+            bt.logging.success(f"Saved model to {model_dir}")
 
             # Clear memory
-            del self_play_dataset, dpo_trainer
+            del best_model, self_play_dataset, dpo_trainer
 
             bt.logging.success("Finished self-play loop")
 
@@ -431,7 +434,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=100,
+                max_samples=10,
                 steps=1,
                 page_size=1
             )
@@ -443,18 +446,23 @@ async def main(config: bt.config):
                 batches=eval_batches,
                 device=config.device
             )
+            bt.logging.success("Evaluated local model for comparison")
 
             # Get comparison model and compute losses
-            comparison_uid = my_uid if not config.offline else config.load_uid
+            comparison_uid = my_uid if not config.offline else 216
             comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
             comparison_losses = ft.validation.compute_losses(
                 model=comparison_model,
                 batches=eval_batches,
                 device=config.device
             )
+            bt.logging.success("Evaluated external model for comparison")
 
             # Clear memory
             del eval_loader, eval_batches, comparison_model
+
+            print(local_losses)
+            print(comparison_losses)
 
             # Calculate win rate
             num_wins = 0

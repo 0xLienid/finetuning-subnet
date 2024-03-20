@@ -157,8 +157,8 @@ class Actions:
             f"Uploaded model to hugging face. Now making public and committing to the chain with model_id: {model_id}"
         )
 
-        self.remote_model_store.make_repo_public(
-            f"{self.hf_repo_namespace}/{self.hf_repo_name}")
+        # self.remote_model_store.make_repo_public(
+        #     f"{self.hf_repo_namespace}/{self.hf_repo_name}")
 
         # We can only commit to the chain every 20 minutes, so run this in a loop, until
         # successful.
