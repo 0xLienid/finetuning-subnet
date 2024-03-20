@@ -327,7 +327,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=500,
+                max_samples=50,
                 steps=1,
                 page_size=1
             )
@@ -414,7 +414,7 @@ async def main(config: bt.config):
                     output_dir=model_dir,
                     per_device_train_batch_size=2,
                     gradient_accumulation_steps=32,
-                    learning_rate=2e-10,
+                    learning_rate=1e-9,
                     num_train_epochs=1,
                 ),
                 beta=0.1,
