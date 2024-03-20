@@ -29,15 +29,13 @@ class HuggingFaceModelStore(RemoteModelStore):
         # PreTrainedModel.save_pretrained only saves locally
         model.tokenizer.push_to_hub(
             repo_id=model.id.namespace + "/" + model.id.name,
-            token=token,
-            use_auth_token=token
+            token=token
         )
 
         commit_info = model.pt_model.push_to_hub(
             repo_id=model.id.namespace + "/" + model.id.name,
             token=token,
-            safe_serialization=True,
-            use_auth_token=token
+            safe_serialization=True
         )
 
         model_id_with_commit = ModelId(

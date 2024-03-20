@@ -125,7 +125,7 @@ def compute_losses(
 
 
 def compute_losses_with_outputs(
-    model, tokenizer, batches: typing.List[typing.Tuple[torch.Tensor, int]], device: str
+    model, tokenizer, batches: typing.List[typing.Tuple[torch.Tensor, int]], temperature: float, device: str
 ) -> typing.List[float]:
     """
     Computes the losses for a given model on provided batches and reports generated
@@ -147,7 +147,8 @@ def compute_losses_with_outputs(
         model.eval()
         for inputs, prompt_len in batches:
             try:
-                print(f"Generating output: {i}")
+                if i % 10 == 0:
+                    print(f"Generating output: {i}")
                 i += 1
 
                 inputs = inputs.to(device)
@@ -160,7 +161,7 @@ def compute_losses_with_outputs(
                 # Generate response samples
                 prompt = inputs[:, :prompt_len]
                 output = model.generate(prompt, generation_config=GenerationConfig(
-                    max_length=constants.sequence_length, do_sample=True, temperature=1.1,
+                    max_length=constants.sequence_length, do_sample=True, temperature=temperature,
                     top_p=0.95, top_k=40, repetition_penalty=1.1,
                     eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id
                 ))

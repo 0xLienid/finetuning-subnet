@@ -132,7 +132,7 @@ def get_config():
     parser.add_argument(
         "--cortex_samples_per_epoch",
         type=int,
-        default=1024,
+        default=8192,
         help="Number of samples trained on per epoch",
     )
     parser.add_argument(
@@ -327,7 +327,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=100,
+                max_samples=500,
                 steps=1,
                 page_size=1
             )
@@ -339,6 +339,7 @@ async def main(config: bt.config):
                 model=model,
                 tokenizer=tokenizer,
                 batches=eval_batches,
+                temperature=1.1,
                 device=config.device
             )
             bt.logging.success("Local model evaluated")
@@ -349,6 +350,7 @@ async def main(config: bt.config):
                 model=best_model,
                 tokenizer=best_tokenizer,
                 batches=eval_batches,
+                temperature=0.8,
                 device=config.device
             )
             bt.logging.success("Best model evaluated")
@@ -434,7 +436,7 @@ async def main(config: bt.config):
             eval_loader = ft.dataset.CortexSubsetLoader(
                 latest=True, running=True,
                 random_seed=random.randint(0, 100000000),
-                max_samples=10,
+                max_samples=20,
                 steps=1,
                 page_size=1
             )
@@ -449,7 +451,7 @@ async def main(config: bt.config):
             bt.logging.success("Evaluated local model for comparison")
 
             # Get comparison model and compute losses
-            comparison_uid = my_uid if not config.offline else 216
+            comparison_uid = my_uid if not config.offline else 246
             comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
             comparison_losses = ft.validation.compute_losses(
                 model=comparison_model,
