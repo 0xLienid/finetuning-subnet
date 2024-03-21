@@ -106,6 +106,48 @@ class HuggingFaceModelStore(RemoteModelStore):
 
         return Model(id=model_id_with_hash, pt_model=model, tokenizer=tokenizer)
 
+    async def download_repo(self, repo_id: str, local_path: str, model_parameters: CompetitionParameters) -> Model:
+        """Retrieves a trained model from Hugging Face."""
+
+        # Check ModelInfo for the size of model.safetensors file before downloading.
+        api = HfApi()
+        model_info = api.model_info(
+            repo_id=repo_id, timeout=10, files_metadata=True
+        )
+        size = sum(repo_file.size for repo_file in model_info.siblings)
+        if size > MAX_HUGGING_FACE_BYTES:
+            raise ValueError(
+                f"Hugging Face repo over maximum size limit. Size {size}. Limit {MAX_HUGGING_FACE_BYTES}."
+            )
+
+        model = model_parameters.architecture.from_pretrained(
+            pretrained_model_name_or_path=repo_id,
+            cache_dir=local_path,
+            use_safetensors=True,
+            **model_parameters.kwargs
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=repo_id,
+            cache_dir=local_path,
+        )
+
+        # Get the directory the model was stored to.
+        model_dir = utils.get_hf_download_path(local_path, repo_id)
+
+        # Realize all symlinks in that directory since Transformers library does not support avoiding symlinks.
+        utils.realize_symlinks_in_directory(model_dir)
+
+        # Compute the hash of the downloaded model.
+        model_hash = utils.get_hash_of_directory(model_dir)
+        model_id_with_hash = ModelId(
+            namespace=repo_id.split("/")[0],
+            name=repo_id.split("/")[1],
+            hash=model_hash,
+            competition_id=model_parameters.competition_id
+        )
+
+        return Model(id=model_id_with_hash, pt_model=model, tokenizer=tokenizer)
+
     def make_repo_public(self, repo_id: str):
         """Makes a Hugging Face repository public."""
         token = HuggingFaceModelStore.assert_access_token_exists()

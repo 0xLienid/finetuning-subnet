@@ -77,9 +77,13 @@ def get_all_linear_layers(model):
 def train(
     model,
     batches,
+    epochs,
+    accumulation_steps,
     learning_rate,
     r,
-    alpha
+    alpha,
+    T_max,
+    eta_min_factor
 ):
     """Trains a LoRA model on the provided data with the provided hyperparams."""
     # Set up LoRA model
@@ -97,48 +101,59 @@ def train(
     optimizer = torch.optim.AdamW(
         lora_model.parameters(), lr=learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=32, eta_min=0.01 * learning_rate)
+        optimizer, T_max=T_max, eta_min=eta_min_factor * learning_rate)
 
     # Train model
-    accumulation_steps = 32
+    epoch_step = 0
+    global_step = 0
     n_acc_steps = 0
     total_loss = 0.0
-    n_batches = 0
     losses = []
-    optimizer.zero_grad()
 
-    for i, (batch, prompt_len) in enumerate(batches):
-        # Move the input batch to the device
-        inputs = batch.to(lora_model.device)
-        labels = inputs.clone()
-        labels[:, :prompt_len] = -100
+    while epoch_step < epochs or epochs == -1:
+        epoch_loss = 0.0
+        n_batches = 0
+        optimizer.zero_grad()
 
-        # Forward pass
-        outputs = lora_model(inputs, labels=labels)
+        for i, (batch, prompt_len) in enumerate(batches):
+            # Move the input batch to the device
+            inputs = batch.to(lora_model.device)
+            labels = inputs.clone()
+            labels[:, :prompt_len] = -100
 
-        # Calculate loss
-        loss = outputs.loss / accumulation_steps  # Scale loss
-        loss.backward()
+            # Forward pass
+            outputs = lora_model(inputs, labels=labels)
 
-        if (i + 1) % accumulation_steps == 0:
-            n_acc_steps += 1
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-            print(f"Step: {n_acc_steps}, Loss: {outputs.loss.detach().item()}")
+            # Calculate loss
+            loss = outputs.loss / accumulation_steps  # Scale loss
+            loss.backward()
 
-        torch.cuda.empty_cache()
+            if (i + 1) % accumulation_steps == 0:
+                n_acc_steps += 1
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                print(
+                    f"Step: {n_acc_steps}, Loss: {outputs.loss.detach().item()}")
 
-        n_batches += 1
-        total_loss += outputs.loss.detach().item()
-        losses.append(outputs.loss.detach().item())
+            torch.cuda.empty_cache()
 
-    # Clear memory
-    lr = scheduler.get_last_lr()[0]
-    del optimizer, scheduler
+            n_batches += 1
+            global_step += 1
+            epoch_loss += outputs.loss.detach().item()
+            total_loss += outputs.loss.detach().item()
+            losses.append(outputs.loss.detach().item())
 
-    # Log the average loss for the epoch
-    print(f"Average loss: {total_loss / n_batches}")
+        # Clear memory
+        lr = scheduler.get_last_lr()[0]
+        del optimizer, scheduler
+
+        # Log the average loss for the epoch
+        print(f"Epoch: {epoch_step} average loss: {epoch_loss / n_batches}")
+        epoch_step += 1
+
+    # Log the average loss for the training
+    print(f"Training average loss: {total_loss / global_step}")
 
     # Return average loss, standard deviation of loss, final learning rate, and model
-    return total_loss / n_batches, torch.std(torch.tensor(losses)), lr, lora_model
+    return total_loss / global_step, torch.std(torch.tensor(losses)), lr, lora_model

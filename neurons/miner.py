@@ -111,6 +111,17 @@ def get_config():
         help="If provided, loads a previously trained HF model from the specified directory",
     )
     parser.add_argument(
+        "--load_repo",
+        type=str,
+        default=None,
+        help="If provided, loads a previously trained HF model from the specified repo",
+    )
+    parser.add_argument(
+        "--comparison_uid",
+        type=int,
+        help="Compares the model under the specified uid to the model being trained.",
+    )
+    parser.add_argument(
         "--num_epochs",
         type=int,
         default=-1,
@@ -196,7 +207,7 @@ async def load_starting_model(
     if config.load_uid is not None:
         # Sync the state from the passed uid.
         model, tokenizer = await actions.load_remote_model(
-            config.load_uid, metagraph, config.model_dir
+            config.load_uid, metagraph, config.model_dir, model_parameters
         )
         bt.logging.success(
             f"Training with model from uid: {config.load_uid}. Model={str(model)}"
@@ -211,8 +222,13 @@ async def load_starting_model(
             f"Training with model from disk. Model={str(model)}")
         return model, tokenizer
 
+    # Check if we should load a model from a remote repo.
+    if config.load_repo:
+        model, tokenizer = await actions.load_repo_model(
+            config.load_repo, metagraph, config.model_dir, model_parameters)
+
     raise RuntimeError(
-        "No starting model specified, pass either --load_best, --load_uid, or --load_model_dir")
+        "No starting model specified, pass either --load_best, --load_uid, --load_model_dir, or --load_repo")
 
 
 async def main(config: bt.config):
@@ -260,7 +276,7 @@ async def main(config: bt.config):
     miner_actions.save(model, tokenizer, model_dir)
 
     comparison_average_loss, comparison_loss_std = ft.training.get_comparison_results(
-        miner_actions, 246, metagraph)
+        miner_actions, config.comparison_uid, metagraph)
     bt.logging.success(f"Comparison average loss: {comparison_average_loss}")
     bt.logging.success(f"Comparison loss std: {comparison_loss_std}")
 
@@ -283,6 +299,11 @@ async def main(config: bt.config):
     tokenized_dataset = ft.training.tokenize_dataset(tokenizer, dataset)
     del dataset, perplexity_column, twenty_fifth_percentile, seventy_fifth_percentile
 
+    # Calculate T_max and eta_min factor for learning rate scheduler
+    T_max = config.num_epochs * (int(len(tokenized_dataset) / 32) + 1)
+    eta_min_factor = 0.01 / \
+        (int(((config.num_epochs * len(tokenized_dataset)) / 10000)) + 1)
+
     # Store data from best run
     best_loss = math.inf
     best_std = math.inf
@@ -294,9 +315,13 @@ async def main(config: bt.config):
         run_avg_loss, run_loss_std, final_lr, _ = ft.training.train(
             model,
             tokenized_dataset[:32],  # Increase to 1024 once bugs are squashed
+            1,
+            config.accumulation_steps,
             combination["learning_rate"],
             combination["r"],
-            combination["alpha"]
+            combination["alpha"],
+            T_max,
+            eta_min_factor
         )
 
         if run_avg_loss < best_loss:
@@ -315,9 +340,13 @@ async def main(config: bt.config):
         model,
         # Increase to full dataset once bugs are squashed
         tokenized_dataset[:1024],
+        config.num_epochs,
+        config.accumulation_steps,
         best_hyperparams["learning_rate"],
         best_hyperparams["r"],
-        best_hyperparams["alpha"]
+        best_hyperparams["alpha"],
+        T_max,
+        eta_min_factor
     )
     del model, tokenized_dataset
 
@@ -347,7 +376,7 @@ async def main(config: bt.config):
     bt.logging.success("Local model evaluated")
 
     # Load the comparison model from the network and compute losses
-    comparison_model, _ = await miner_actions.load_remote_model(246, metagraph, "temp_comparison_model")
+    comparison_model, _ = await miner_actions.load_remote_model(config.comparison_uid, metagraph, "temp_comparison_model")
     comparison_losses_and_outputs = ft.validation.compute_losses_with_outputs(
         model=comparison_model,
         tokenizer=tokenizer,
