@@ -6,6 +6,7 @@ Prerequisites:
     1. HF_ACCESS_TOKEN is set in the environment or .env file
 """
 
+import asyncio
 import argparse
 import torch
 import random
@@ -96,11 +97,11 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
         batches=batches,
         device=device
     )
-    perplexities = torch.exp(loss for loss in losses)
+    perplexities = torch.exp(torch.tensor([loss for loss in losses]))
 
     # Create the dataset
-    prompts = loader.buffer[:, 0]
-    responses = loader.buffer[:, 1]
+    prompts = [sample[0] for sample in loader.buffer]
+    responses = [sample[1] for sample in loader.buffer]
     dataset = Dataset.from_dict({
         "question": prompts,
         "response": responses,
@@ -114,7 +115,7 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     open_orca = load_dataset("Open-Orca/OpenOrca", split="train")
     open_orca = open_orca.remove_columns(
         [col for col in open_orca.column_names if col not in ["question", "response"]])
-    open_orca = open_orca.shuffle(seed=42)[:50000]
+    open_orca = open_orca.shuffle(seed=42).select(range(50000))
     batches = tokenize_data(tokenizer, open_orca)
 
     # Calculate losses
@@ -123,7 +124,7 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
         batches=batches,
         device=device
     )
-    perplexities = torch.exp(loss for loss in losses)
+    perplexities = torch.exp(torch.tensor([loss for loss in losses]))
 
     # Create the dataset
     prompts = open_orca["question"]
@@ -145,5 +146,5 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
 
 if __name__ == "__main__":
     config = get_config()
-    main(config.ref_model, config.tokenizer,
-         config.cortex_data_points, config.hf_dataset_id)
+    asyncio.run(main(config.ref_model, config.tokenizer,
+                     config.cortex_data_points, config.hf_dataset_id))

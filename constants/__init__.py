@@ -4,6 +4,7 @@ from transformers import PreTrainedModel, LlamaForCausalLM, GemmaForCausalLM
 from typing import Type, Optional, Any, List, Tuple
 import math
 
+
 @dataclass
 class CompetitionParameters:
     """Class defining model parameters"""
@@ -24,6 +25,7 @@ class CompetitionParameters:
 # ---------------------------------
 # Project Constants.
 # ---------------------------------
+
 
 # The validator WANDB project.
 WANDB_PROJECT = "finetuning-subnet"
@@ -53,7 +55,7 @@ COMPETITION_SCHEDULE: List[CompetitionParameters] = [
         max_model_parameter_size=3 * 1024 * 1024 * 1024,
         architecture=GemmaForCausalLM,
         kwargs={},
-        tokenizer="NousResearch/gemma-7b-it-tokenizer",
+        tokenizer="NousResearch/gemma-2b-it-tokenizer",
         reward_percentage=0.67,
         competition_id="g1"
     )
@@ -61,8 +63,10 @@ COMPETITION_SCHEDULE: List[CompetitionParameters] = [
 ORIGINAL_COMPETITION_ID = "m1"
 
 
-assert math.isclose(sum(x.reward_percentage for x in COMPETITION_SCHEDULE), 1.0)
-assert all(len(x.competition_id) > 0 and len(x.competition_id) <= 2 for x in COMPETITION_SCHEDULE)
+assert math.isclose(
+    sum(x.reward_percentage for x in COMPETITION_SCHEDULE), 1.0)
+assert all(len(x.competition_id) > 0 and len(
+    x.competition_id) <= 2 for x in COMPETITION_SCHEDULE)
 
 # ---------------------------------
 # Miner/Validator Model parameters.

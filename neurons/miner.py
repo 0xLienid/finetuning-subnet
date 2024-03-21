@@ -25,13 +25,14 @@ import random
 import argparse
 import constants
 import typing
+import numpy as np
 from model.model_updater import ModelUpdater
 from model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
 import finetune as ft
 import bittensor as bt
-from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments
-from datasets import Dataset
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments, AutoTokenizer
+from datasets import Dataset, load_dataset
 from trl import DPOTrainer
 from finetune.mining import Actions
 from utilities import utils
@@ -242,11 +243,13 @@ async def main(config: bt.config):
     model_parameters.kwargs["attn_implementation"] = config.attn_implementation
 
     # Init model.
-    model, tokenizer = await load_starting_model(miner_actions, config, metagraph, model_parameters)
+    model, _ = await load_starting_model(miner_actions, config, metagraph, model_parameters)
     model = model.train()
     model = model.to(config.device)
 
-    # Adjust chat template
+    # Init tokenizer and adjust chat template
+    tokenizer = AutoTokenizer.from_pretrained(
+        "NousResearch/gemma-2b-it-tokenizer")
     if not tokenizer.chat_template.endswith("{{ eos_token }}"):
         template = tokenizer.chat_template
         template = template + "{{ eos_token }}"
@@ -256,241 +259,232 @@ async def main(config: bt.config):
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
 
-    # Build optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    comparison_average_loss, comparison_loss_std = ft.training.get_comparison_results(
+        miner_actions, 246, metagraph)
+    bt.logging.success(f"Comparison average loss: {comparison_average_loss}")
+    bt.logging.success(f"Comparison loss std: {comparison_loss_std}")
 
-    # Start the training loop
-    global_step = 0
-    n_acc_steps = 0
-    accumulation_steps = config.accumulation_steps
+    # Set up hyperparameter search
+    hyperparams = {
+        "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
+        "r": [16, 32, 64],
+        "alpha": [32, 64, 128]
+    }
+    hyperparam_combinations = ft.training.generate_hyperparam_combinations(
+        hyperparams)
 
-    try:
-        # Initialize loss accumulator for the epoch
-        epoch_loss = 0.0
+    # Load and set up the dataset
+    dataset = load_dataset("Lienid/chat_perplexity_scored", split="train")
+    perplexity_column = dataset["perplexity"]
+    twenty_fifth_percentile = np.percentile(perplexity_column, 25)
+    seventy_fifth_percentile = np.percentile(perplexity_column, 75)
+    dataset = dataset.filter(
+        lambda example: example["perplexity"] > twenty_fifth_percentile and example["perplexity"] < seventy_fifth_percentile)
+    tokenized_dataset = ft.training.tokenize_dataset(tokenizer, dataset)
+    del dataset, perplexity_column, twenty_fifth_percentile, seventy_fifth_percentile
 
-        # Prepare the data loader with random pages for each epoch
-        bt.logging.success(
-            f"Loading {config.cortex_samples_per_epoch} pages for training this epoch"
+    # Store data from best run
+    best_loss = math.inf
+    best_std = math.inf
+    best_final_lr = 0
+    best_hyperparams = None
+
+    # Train the model with each hyperparameter combination
+    for combination in hyperparam_combinations:
+        run_avg_loss, run_loss_std, final_lr, _ = ft.training.train(
+            model,
+            tokenized_dataset[:32],  # Increase to 1024 once bugs are squashed
+            combination["learning_rate"],
+            combination["r"],
+            combination["alpha"]
         )
-        loader = ft.dataset.CortexSubsetLoader(
-            latest=False,
-            random_seed=random.randint(0, 100000000),
-            max_samples=config.cortex_samples_per_epoch,
-            steps=config.cortex_steps,
-            page_size=config.cortex_steps,
+
+        if run_avg_loss < best_loss:
+            best_loss = run_avg_loss
+            best_std = run_loss_std
+            best_final_lr = final_lr
+            best_hyperparams = combination
+
+    # Log the best hyperparameters
+    bt.logging.success(f"Best loss: {best_loss}")
+    bt.logging.success(f"Best loss std: {best_std}")
+    bt.logging.success(f"Best hyperparams: {best_hyperparams}")
+
+    # Run full training with best hyperparameters
+    _, _, _, lora_model = ft.training.train(
+        model,
+        # Increase to full dataset once bugs are squashed
+        tokenized_dataset[:1024],
+        best_hyperparams["learning_rate"],
+        best_hyperparams["r"],
+        best_hyperparams["alpha"]
+    )
+    del model, tokenized_dataset
+
+    # Merge weights and save the model
+    model = lora_model.merge_and_unload()
+    miner_actions.save(model, tokenizer, model_dir)
+
+    # Load cortex dataset for DPO
+    dpo_loader = ft.dataset.CortexSubsetLoader(
+        latest=True, running=True,
+        random_seed=random.randint(0, 100000000),
+        max_samples=5,  # Increase to 100 once bugs are squashed
+        steps=config.cortex_steps,
+        page_size=config.cortex_steps
+    )
+    dpo_prompts = [sample[0] for sample in dpo_loader.buffer]
+    dpo_batches = dpo_loader.tokenize(tokenizer)
+
+    # Compute losses and get responses for local model
+    local_losses_and_outputs = ft.validation.compute_losses_with_outputs(
+        model=model,
+        tokenizer=tokenizer,
+        batches=dpo_batches,
+        temperature=1.1,
+        device=config.device
+    )
+    bt.logging.success("Local model evaluated")
+
+    # Load the comparison model from the network and compute losses
+    comparison_model, _ = await miner_actions.load_remote_model(246, metagraph, "temp_comparison_model")
+    comparison_losses_and_outputs = ft.validation.compute_losses_with_outputs(
+        model=comparison_model,
+        tokenizer=tokenizer,
+        batches=dpo_batches,
+        temperature=0.8,
+        device=config.device
+    )
+    bt.logging.success("Comparison model evaluated")
+    del dpo_loader, dpo_batches
+
+    # Compare the losses and build DPO dataset of winning responses
+    num_wins = 0
+    sum_loss = 0.0
+    dpo_dataset = []
+    for result_pair in zip(local_losses_and_outputs, comparison_losses_and_outputs, dpo_prompts):
+        local = result_pair[0]
+        comparison = result_pair[1]
+        prompt = result_pair[2]
+        iswin = ft.validation.iswin(local["loss"], comparison["loss"], 1, 0)
+        sum_loss += local["loss"]
+
+        if iswin:
+            num_wins += 1
+            dpo_dataset.append({
+                "question": prompt,
+                "chosen": local["response"],
+                "rejected": comparison["response"]
+            })
+        else:
+            dpo_dataset.append({
+                "question": prompt,
+                "chosen": comparison["response"],
+                "rejected": local["response"]
+            })
+
+    # Log the win rate and average loss
+    bt.logging.success(
+        f"Initial win rate: {num_wins / len(local_losses_and_outputs)}")
+    bt.logging.success(
+        f"Initial average loss: {sum_loss / len(local_losses_and_outputs)}")
+
+    # Clear memory
+    del local_losses_and_outputs, comparison_losses_and_outputs
+
+    # Set up DPO training
+    prompt_column = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": sample["question"]}],
+            truncation=True,
+            return_tensors="pt",
+            max_length=constants.sequence_length,
+            tokenize=False,
+            add_generation_prompt=True
         )
-        batches = loader.tokenize(tokenizer)
+        for sample in dpo_dataset]
+    self_play_dataset = Dataset.from_pandas(
+        pd.DataFrame(data=dpo_dataset))
+    self_play_dataset = self_play_dataset.add_column(
+        "prompt", prompt_column)
 
-        # Enumerate over the data loader
-        n_batches = 0
-        optimizer.zero_grad()  # Initialize gradients to zero
+    # Train the DPO model
+    dpo_trainer = DPOTrainer(
+        model,
+        comparison_model,
+        args=TrainingArguments(
+            output_dir=model_dir,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=32,
+            learning_rate=best_final_lr,
+            num_train_epochs=1,
+        ),
+        beta=0.1,
+        train_dataset=self_play_dataset,
+        tokenizer=tokenizer,
+    )
+    dpo_trainer.train()
 
-        for i, (batch, prompt_len) in enumerate(batches):
-            # Move the input batch to the device
-            inputs = batch.to(model.device)
-            labels = inputs.clone()
-            labels[:, :prompt_len] = -100
+    # Save model locally
+    miner_actions.save(model, tokenizer, model_dir)
+    bt.logging.success(f"Saved model to {model_dir}")
 
-            # Forward pass: compute the model output and loss
-            outputs = model(inputs, labels=labels)
+    # Clear memory
+    del self_play_dataset, dpo_trainer
+    bt.logging.success("Finished self-play loop")
 
-            loss = outputs.loss / accumulation_steps  # Scale loss
-            loss.backward()  # Accumulate gradients
+    # Get final eval dataset
+    eval_loader = ft.dataset.CortexSubsetLoader(
+        latest=True, running=True,
+        random_seed=random.randint(0, 100000000),
+        max_samples=5,  # Increase to 20 once bugs are squashed
+        steps=1,
+        page_size=1
+    )
+    eval_batches = eval_loader.tokenize(tokenizer)
 
-            if (i + 1) % accumulation_steps == 0:
-                n_acc_steps += 1
-                optimizer.step()  # Perform a single optimization step
-                optimizer.zero_grad()  # Clear gradients
-                scheduler.step()  # Update learning rate
-                bt.logging.success(
-                    f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
-                )
+    # Compute losses for local model
+    local_losses = ft.validation.compute_losses(
+        model=model,
+        batches=eval_batches,
+        device=config.device
+    )
+    bt.logging.success("Evaluated local model for comparison")
 
-            torch.cuda.empty_cache()
+    # Compute losses for comparison model
+    comparison_losses = ft.validation.compute_losses(
+        model=comparison_model,
+        batches=eval_batches,
+        device=config.device
+    )
+    bt.logging.success("Evaluated comparison model for comparison")
 
-            n_batches += 1
-            global_step += 1
-            epoch_loss += outputs.loss.detach().item()
+    # Clear memory
+    del comparison_model, eval_loader, eval_batches
 
-        # Calculate the average loss for the epoch
-        avg_loss = epoch_loss / n_batches
+    print(local_losses)
+    print(comparison_losses)
 
-        # Clear memory
-        del loader, batches, optimizer, scheduler
+    # Calculate win rate
+    num_wins = 0
+    sum_loss = 0.0
+    for result_pair in zip(local_losses, comparison_losses):
+        local_loss = result_pair[0]
+        comparison_loss = result_pair[1]
+        iswin = ft.validation.iswin(local_loss, comparison_loss, 1, 0)
+        sum_loss += local_loss
 
-        # Log the average loss for the epoch
-        bt.logging.success(f"Pretraining average loss: {avg_loss}")
+        if iswin:
+            num_wins += 1
 
-        # Self-Play
-        while True:
-            # Load data for head-to-head evaluation against best model
-            eval_loader = ft.dataset.CortexSubsetLoader(
-                latest=True, running=True,
-                random_seed=random.randint(0, 100000000),
-                max_samples=100,
-                steps=1,
-                page_size=1
-            )
-            prompts = eval_loader.get_prompts()
-            eval_batches = eval_loader.tokenize(tokenizer)
+    bt.logging.success(f"Comparison win rate: {num_wins / len(local_losses)}")
+    bt.logging.success(
+        f"Comparison average loss: {sum_loss / len(local_losses)}")
 
-            # Compute losses and get responses for local model
-            local_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-                model=model,
-                tokenizer=tokenizer,
-                batches=eval_batches,
-                temperature=1.1,
-                device=config.device
-            )
-            bt.logging.success("Local model evaluated")
-
-            # Load the best model from the network and compute losses
-            best_model, best_tokenizer = await miner_actions.load_remote_model(config.load_uid, metagraph, config.model_dir)
-            best_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-                model=best_model,
-                tokenizer=best_tokenizer,
-                batches=eval_batches,
-                temperature=0.8,
-                device=config.device
-            )
-            bt.logging.success("Best model evaluated")
-            del best_tokenizer, eval_loader, eval_batches
-
-            # Compare the losses and build DPO dataset of winning responses
-            num_wins = 0
-            sum_loss = 0.0
-            dpo_dataset = []
-            for result_pair in zip(local_losses_and_outputs, best_losses_and_outputs, prompts):
-                local = result_pair[0]
-                best = result_pair[1]
-                prompt = result_pair[2]
-                iswin = ft.validation.iswin(local["loss"], best["loss"], 1, 0)
-                sum_loss += local["loss"]
-
-                if iswin:
-                    num_wins += 1
-                    dpo_dataset.append({
-                        "question": prompt,
-                        "chosen": local["response"],
-                        "rejected": best["response"]
-                    })
-                else:
-                    dpo_dataset.append({
-                        "question": prompt,
-                        "chosen": best["response"],
-                        "rejected": local["response"]
-                    })
-
-            # Log the win rate and average loss
-            bt.logging.success(
-                f"Initial win rate: {num_wins / len(local_losses_and_outputs)}")
-            bt.logging.success(
-                f"Initial average loss: {sum_loss / len(local_losses_and_outputs)}")
-
-            # Clear memory
-            del local_losses_and_outputs, best_losses_and_outputs
-
-            # Set up DPO training
-            prompt_column = [
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": sample["question"]}],
-                    truncation=True,
-                    return_tensors="pt",
-                    max_length=constants.sequence_length,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                for sample in dpo_dataset]
-            self_play_dataset = Dataset.from_pandas(
-                pd.DataFrame(data=dpo_dataset))
-            self_play_dataset = self_play_dataset.add_column(
-                "prompt", prompt_column)
-
-            # Train the DPO model
-            dpo_trainer = DPOTrainer(
-                model,
-                best_model,
-                args=TrainingArguments(
-                    output_dir=model_dir,
-                    per_device_train_batch_size=2,
-                    gradient_accumulation_steps=32,
-                    learning_rate=1e-9,
-                    num_train_epochs=1,
-                ),
-                beta=0.1,
-                train_dataset=self_play_dataset,
-                tokenizer=tokenizer,
-            )
-            dpo_trainer.train()
-
-            # Save model locally
-            miner_actions.save(model, tokenizer, model_dir)
-            bt.logging.success(f"Saved model to {model_dir}")
-
-            # Clear memory
-            del best_model, self_play_dataset, dpo_trainer
-
-            bt.logging.success("Finished self-play loop")
-
-            # Get final eval dataset
-            eval_loader = ft.dataset.CortexSubsetLoader(
-                latest=True, running=True,
-                random_seed=random.randint(0, 100000000),
-                max_samples=20,
-                steps=1,
-                page_size=1
-            )
-            eval_batches = eval_loader.tokenize(tokenizer)
-
-            # Compute losses for local model
-            local_losses = ft.validation.compute_losses(
-                model=model,
-                batches=eval_batches,
-                device=config.device
-            )
-            bt.logging.success("Evaluated local model for comparison")
-
-            # Get comparison model and compute losses
-            comparison_uid = 246
-            comparison_model, _ = await miner_actions.load_remote_model(comparison_uid, metagraph, "temp_comparison_model")
-            comparison_losses = ft.validation.compute_losses(
-                model=comparison_model,
-                batches=eval_batches,
-                device=config.device
-            )
-            bt.logging.success("Evaluated external model for comparison")
-
-            # Clear memory
-            del eval_loader, eval_batches, comparison_model
-
-            print(local_losses)
-            print(comparison_losses)
-
-            # Calculate win rate
-            num_wins = 0
-            sum_loss = 0.0
-            for result_pair in zip(local_losses, comparison_losses):
-                local_loss = result_pair[0]
-                comparison_loss = result_pair[1]
-                iswin = ft.validation.iswin(local_loss, comparison_loss, 1, 0)
-                sum_loss += local_loss
-
-                if iswin:
-                    num_wins += 1
-
-            bt.logging.success(
-                f"Comparison win rate: {num_wins / len(local_losses)}")
-            bt.logging.success(
-                f"Comparison average loss: {sum_loss / len(local_losses)}")
-
-            if not config.offline:
-                model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
-                    model_dir, model_parameters)
-                await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
-    except Exception as e:
-        bt.logging.error(f"Failed with error: {e}")
+    if not config.offline:
+        model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
+            model_dir, model_parameters)
+        await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
 
 
 if __name__ == "__main__":
