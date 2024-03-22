@@ -66,12 +66,13 @@ def train(
     r,
     alpha,
     T_max,
-    eta_min_factor
+    eta_min_factor,
+    wandb_project
 ):
     """Trains a LoRA model on the provided data with the provided hyperparams."""
     wandb.login(key=os.getenv["WANDB_API_KEY"])
     run = wandb.init(
-        project="nous-lora-finetuning",
+        project=wandb_project,
         config={"learning_rate": learning_rate, "epochs": epochs}
     )
 
@@ -99,7 +100,7 @@ def train(
     total_loss = 0.0
     losses = []
 
-    while epoch_step < epochs or epochs == -1:
+    while epoch_step < epochs:
         epoch_loss = 0.0
         n_batches = 0
         optimizer.zero_grad()
@@ -145,13 +146,13 @@ def train(
             total_loss += outputs.loss.detach().item()
             losses.append(outputs.loss.detach().item())
 
-        # Clear memory
-        lr = scheduler.get_last_lr()[0]
-        del optimizer, scheduler
-
         # Log the average loss for the epoch
         print(f"Epoch: {epoch_step} average loss: {epoch_loss / len(batches)}")
         epoch_step += 1
+
+    # Clear memory
+    lr = scheduler.get_last_lr()[0]
+    del optimizer, scheduler
 
     # Log the average loss for the training
     print(f"Training average loss: {total_loss / global_step}")

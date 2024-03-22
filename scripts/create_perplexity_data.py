@@ -149,8 +149,8 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     del open_orca, batches, losses, perplexities
 
     # Remove duplicates and NaN values
-    dataset = dataset.select(lambda example: np.unique(
-        example["question"], return_index == True)[1])
+    dataset = dataset.select(np.unique(
+        dataset["question"], return_index=True)[1])
     dataset = dataset.filter(lambda x: x["perplexity"] == x["perplexity"])
 
     # Save the dataset

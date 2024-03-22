@@ -133,7 +133,7 @@ class Actions:
         return model.pt_model, model.tokenizer
 
     async def load_repo_model(
-            self, repo_id: str, metagraph: bt.metagraph, download_dir: str, model_parameters: CompetitionParameters
+            self, repo_id: str, latest_commit: str, download_dir: str, model_parameters: CompetitionParameters
     ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
         """Loads the model from the Hugging Face repository.
 
@@ -143,7 +143,7 @@ class Actions:
             download_dir (str): The directory to download the model to.
         """
         model: Model = await self.remote_model_store.download_repo(
-            repo_id, download_dir, model_parameters)
+            repo_id, latest_commit, download_dir, model_parameters)
         return model.pt_model, model.tokenizer
 
     async def push(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, competition_parameters: CompetitionParameters, retry_delay_secs: int = 60):

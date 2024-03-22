@@ -106,7 +106,7 @@ class HuggingFaceModelStore(RemoteModelStore):
 
         return Model(id=model_id_with_hash, pt_model=model, tokenizer=tokenizer)
 
-    async def download_repo(self, repo_id: str, local_path: str, model_parameters: CompetitionParameters) -> Model:
+    async def download_repo(self, repo_id: str, latest_commit: str, local_path: str, model_parameters: CompetitionParameters) -> Model:
         """Retrieves a trained model from Hugging Face."""
 
         # Check ModelInfo for the size of model.safetensors file before downloading.
@@ -135,7 +135,7 @@ class HuggingFaceModelStore(RemoteModelStore):
         model_id = ModelId(
             namespace=repo_id.split("/")[0],
             name=repo_id.split("/")[1],
-            commit="9ee3f7899febd1ed16368600d801912b34acbde7"
+            commit=latest_commit
         )
         model_dir = utils.get_hf_download_path(
             local_path=local_path, model_id=model_id)
