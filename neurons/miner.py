@@ -19,21 +19,26 @@
 import asyncio
 import math
 import os
+import copy
 import wandb
 import torch
 import random
 import argparse
 import constants
 import typing
+import numpy as np
 from model.model_updater import ModelUpdater
 from model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
 import finetune as ft
 import bittensor as bt
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments, AutoTokenizer
+from datasets import Dataset, load_dataset
+from trl import DPOTrainer
 from finetune.mining import Actions
 from utilities import utils
 import datetime as dt
+import pandas as pd
 
 from dotenv import load_dotenv
 
@@ -65,17 +70,12 @@ def get_config():
     parser.add_argument(
         "--wandb_project", type=str, help="The wandb project to log to."
     )
-    parser.add_argument("--wandb_entity", type=str, help="The wandb entity to log to.")
+    parser.add_argument("--wandb_entity", type=str,
+                        help="The wandb entity to log to.")
     parser.add_argument(
         "--hf_repo_id",
         type=str,
         help="The hugging face repo id, which should include the org or user and repo name. E.g. jdoe/finetuned",
-    )
-    parser.add_argument(
-        "--avg_loss_upload_threshold",
-        type=float,
-        default=0,  # Default to never uploading.
-        help="The threshold for avg_loss the model must achieve to upload it to hugging face. A miner can only advertise one model, so it should be the best one.",
     )
     parser.add_argument(
         "--model_dir",
@@ -106,12 +106,28 @@ def get_config():
         help="If provided, loads a previously trained HF model from the specified directory",
     )
     parser.add_argument(
+        "--load_repo",
+        type=str,
+        default=None,
+        help="If provided, loads a previously trained HF model from the specified repo",
+    )
+    parser.add_argument(
+        "--download_repo_latest_commit",
+        type=str,
+        default=None,
+        help="Specifies the latest commit for the remote repo. This is required to identify the local snapshot download path.",
+    )
+    parser.add_argument(
+        "--comparison_uid",
+        type=int,
+        help="Compares the model under the specified uid to the model being trained.",
+    )
+    parser.add_argument(
         "--num_epochs",
         type=int,
-        default=-1,
-        help="Number of training epochs (-1 is infinite)",
+        default=1,
+        help="Number of training epochs",
     )
-    parser.add_argument("--lr", type=float, default=0.00001, help="Learning rate.")
     parser.add_argument(
         "--accumulation_steps",
         type=int,
@@ -127,7 +143,7 @@ def get_config():
     parser.add_argument(
         "--cortex_samples_per_epoch",
         type=int,
-        default=4096,
+        default=20480,
         help="Number of samples trained on per epoch",
     )
     parser.add_argument(
@@ -157,6 +173,17 @@ def get_config():
         "--list_competitions",
         action="store_true",
         help="Print out all competitions"
+    )
+    parser.add_argument(
+        "--use_cortex",
+        action="store_true",
+        help="If set, the miner uses Cortex subnet data to train.",
+    )
+    parser.add_argument(
+        "--dataset_repo_id",
+        type=str,
+        default=None,
+        help="If provided, uses the dataset from the specified repo to train.",
     )
 
     # Include wallet and logging arguments from bittensor
@@ -199,11 +226,25 @@ async def load_starting_model(
 
     # Check if we should load a model from a local directory.
     if config.load_model_dir:
-        model, tokenizer = actions.load_local_model(config.load_model_dir, model_parameters)
-        bt.logging.success(f"Training with model from disk. Model={str(model)}")
+        model, tokenizer = actions.load_local_model(
+            config.load_model_dir, model_parameters)
+        bt.logging.success(
+            f"Training with model from disk. Model={str(model)}")
         return model, tokenizer
 
-    raise RuntimeError("No starting model specified, pass either --load_best, --load_uid, or --load_model_dir")
+    # Check if we should load a model from a remote repo.
+    if config.load_repo:
+        if not config.download_repo_latest_commit:
+            raise RuntimeError(
+                f"Latest commit hash not specified for repo {config.load_repo}")
+
+        model, tokenizer = await actions.load_repo_model(
+            config.load_repo, config.download_repo_latest_commit, config.model_dir, model_parameters)
+        return model, tokenizer
+
+    raise RuntimeError(
+        "No starting model specified, pass either --load_best, --load_uid, --load_model_dir, or --load_repo")
+
 
 async def main(config: bt.config):
     # Create bittensor objects.
@@ -217,7 +258,7 @@ async def main(config: bt.config):
     my_uid = None
     if not config.offline:
         my_uid = utils.assert_registered(wallet, metagraph)
-        HuggingFaceModelStore.assert_access_token_exists()
+        hf_token = HuggingFaceModelStore.assert_access_token_exists()
 
     # Configure the stores and miner actions.
     miner_actions = ft.mining.Actions.create(config, wallet, subtensor)
@@ -227,17 +268,9 @@ async def main(config: bt.config):
     model_dir = ft.mining.model_path(config.model_dir, run_id)
     os.makedirs(model_dir, exist_ok=True)
 
-    use_wandb = False
-    if not config.offline:
-        if config.wandb_project is None or config.wandb_entity is None:
-            bt.logging.warning(
-                "Wandb project or entity not specified. This run will not be logged to wandb"
-            )
-        else:
-            use_wandb = True
-
     block = metagraph.block.item()
-    model_parameters = ModelUpdater.get_competition_parameters(config.competition_id)
+    model_parameters = ModelUpdater.get_competition_parameters(
+        config.competition_id)
     if not model_parameters:
         raise RuntimeError(
             f"No model parameters found for block {block}"
@@ -246,144 +279,182 @@ async def main(config: bt.config):
     model_parameters.kwargs["attn_implementation"] = config.attn_implementation
 
     # Init model.
-    model, tokenizer = await load_starting_model(miner_actions, config, metagraph, model_parameters)
+    model, _ = await load_starting_model(miner_actions, config, metagraph, model_parameters)
     model = model.train()
     model = model.to(config.device)
+
+    # Init tokenizer and adjust chat template
+    tokenizer = AutoTokenizer.from_pretrained(
+        "NousResearch/gemma-2b-it-tokenizer")
+    if not tokenizer.chat_template.endswith("{{ eos_token }}"):
+        template = tokenizer.chat_template
+        template = template + "{{ eos_token }}"
+        tokenizer.chat_template = template
+        del template
 
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
 
-    # Build optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
-    wandb_run = None
+    # Set up hyperparameter search
+    hyperparams = {
+        "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
+        "r": [32, 64, 128],
+        "alpha": [16]
+    }
+    hyperparam_combinations = ft.training.generate_hyperparam_combinations(
+        hyperparams)
 
-    # If using wandb, start a new run.
-    if use_wandb:
-        token = os.getenv("WANDB_API_KEY")
-        if not token:
-            raise ValueError(
-                "To use Wandb, you must set WANDB_API_KEY in your .env file"
-            )
-
-        wandb.login(key=token)
-
-        wandb_run = wandb.init(
-            name=run_id,
-            entity=config.wandb_entity,
-            project=config.wandb_project,
-            config={
-                "uid": my_uid,
-                "hotkey": wallet.hotkey.ss58_address,
-                "run_name": run_id,
-                "version": ft.__version__,
-                "type": "miner",
-            },
-            allow_val_change=True,
+    # Load and set up the dataset
+    batches = []
+    if config.use_cortex:
+        loader = ft.dataset.CortexSubsetLoader(
+            latest=True, running=True,
+            random_seed=random.randint(0, 100000000),
+            max_samples=config.cortex_samples_per_epoch,
+            steps=config.cortex_steps,
+            page_size=1
         )
-    else:
-        bt.logging.warning(
-            "Not posting run to wandb. Either --offline is specified or the wandb settings are missing."
+        batches = loader.tokenize(tokenizer)
+        del loader
+    elif config.dataset_repo_id is not None:
+        dataset = load_dataset(config.dataset_repo_id, split="train")
+
+        # Optional: Dataset preprocessing
+        # perplexity_column = np.array(dataset["perplexity"])
+        # perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
+        # thirtieth_percentile = np.percentile(perplexity_column, 30)
+        # eightieth_percentile = np.percentile(perplexity_column, 80)
+        # dataset = dataset.filter(
+        #     lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
+
+        batches = ft.training.tokenize_dataset(tokenizer, dataset)
+        del dataset
+
+    # Load and set up eval dataset
+    eval_loader = ft.dataset.CortexSubsetLoader(
+        latest=True, running=True,
+        random_seed=random.randint(0, 100000000),
+        max_samples=32 * 3,
+        steps=1,
+        page_size=1
+    )
+    eval_batches = eval_loader.tokenize(tokenizer)
+
+    # Calculate T_max and eta_min factor for learning rate scheduler
+    T_max = config.num_epochs * \
+        (int(len(batches) / config.accumulation_steps) + 1)
+    eta_min_factor = 0.01
+
+    # Store data from best run
+    best_loss = math.inf
+    best_std = math.inf
+    best_hyperparams = None
+
+    num_search_batches = len(batches) // 10
+
+    # Train the model with each hyperparameter combination
+    for i, combination in enumerate(hyperparam_combinations):
+        print(f"Hyperparam combination: {i}")
+
+        run_model = copy.deepcopy(model)
+        run_avg_loss, run_loss_std, _, _ = ft.training.train(
+            run_model,
+            batches[:num_search_batches],
+            1,
+            config.accumulation_steps,
+            combination["learning_rate"],
+            combination["r"],
+            combination["alpha"],
+            T_max,
+            eta_min_factor,
+            config.wandb_project
         )
 
-    # Start the training loop
-    epoch_step = 0
-    global_step = 0
-    n_acc_steps = 0
-    best_avg_loss = math.inf
-    accumulation_steps = config.accumulation_steps
+        if run_avg_loss < best_loss:
+            best_loss = run_avg_loss
+            best_std = run_loss_std
+            best_hyperparams = combination
 
-    try:
-        while epoch_step < config.num_epochs or config.num_epochs == -1:
-            # Initialize loss accumulator for the epoch
-            epoch_loss = 0.0
+    # Log the best hyperparameters
+    bt.logging.success(f"Best loss: {best_loss}")
+    bt.logging.success(f"Best loss std: {best_std}")
+    bt.logging.success(f"Best hyperparams: {best_hyperparams}")
 
-            # Prepare the data loader with random pages for each epoch
-            bt.logging.success(
-                f"Loading {config.cortex_samples_per_epoch} pages for training this epoch"
-            )
-            loader = ft.dataset.CortexSubsetLoader(
-                latest=False,
-                random_seed=random.randint(0, 100000000),
-                max_samples=config.cortex_samples_per_epoch,
-                steps=config.cortex_steps,
-                page_size=config.cortex_steps,
-            )
-            batches = loader.tokenize(tokenizer)
+    # Run full training with best hyperparameters
+    _, _, _, lora_model = ft.training.train(
+        model,
+        batches,
+        eval_batches,
+        config.num_epochs,
+        config.accumulation_steps,
+        best_hyperparams["learning_rate"],
+        best_hyperparams["r"],
+        best_hyperparams["alpha"],
+        T_max,
+        eta_min_factor,
+        config.wandb_project
+    )
+    del model, batches, eval_batches
 
-            # Enumerate over the data loader
-            n_batches = 0
-            optimizer.zero_grad()  # Initialize gradients to zero
+    # Merge weights and save the model
+    model = lora_model.merge_and_unload()
+    miner_actions.save(model, tokenizer, model_dir +
+                       best_hyperparams["learning_rate"] + "_" + best_hyperparams["r"] + "_" + best_hyperparams["alpha"])
+    bt.logging.success("Saving merged LoRA model")
 
-            for i, (batch, _) in enumerate(batches):
-                # Move the input batch to the device
-                inputs = batch.to(model.device)
+    # Get new eval batches
+    eval_loader = ft.dataset.CortexSubsetLoader(
+        latest=True, running=True,
+        random_seed=random.randint(0, 100000000),
+        max_samples=32 * 3,
+        steps=1,
+        page_size=1
+    )
+    eval_batches = eval_loader.tokenize(tokenizer)
 
-                # Forward pass: compute the model output and loss
-                outputs = model(inputs, labels=inputs)
+    # Compute losses for local model
+    local_losses = ft.validation.compute_losses(
+        model=model,
+        batches=eval_batches,
+        device=config.device
+    )
+    bt.logging.success("Evaluated local model for comparison")
 
-                loss = outputs.loss / accumulation_steps  # Scale loss
-                loss.backward()  # Accumulate gradients
+    # Compute losses for comparison model
+    comparison_model, _ = await miner_actions.load_remote_model(config.comparison_uid, metagraph, "temp_comparison_model")
+    comparison_losses = ft.validation.compute_losses(
+        model=comparison_model,
+        batches=eval_batches,
+        device=config.device
+    )
+    bt.logging.success("Evaluated comparison model for comparison")
 
-                if (i + 1) % accumulation_steps == 0:
-                    n_acc_steps += 1
-                    optimizer.step()  # Perform a single optimization step
-                    optimizer.zero_grad()  # Clear gradients
-                    bt.logging.success(
-                        f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
-                    )
-                    if use_wandb:
-                        wandb_run.log(
-                            {"loss": outputs.loss.detach(), "n_batches": n_batches},
-                            step=n_acc_steps,
-                        )
+    # Clear memory
+    del comparison_model, eval_loader, eval_batches
 
-                torch.cuda.empty_cache()
+    print(local_losses)
+    print(comparison_losses)
 
-                n_batches += 1
-                global_step += 1
-                epoch_loss += outputs.loss.detach().item()
+    # Calculate win rate
+    num_wins = 0
+    sum_loss = 0.0
+    for result_pair in zip(local_losses, comparison_losses):
+        local_loss = result_pair[0]
+        comparison_loss = result_pair[1]
+        iswin = ft.validation.iswin(local_loss, comparison_loss, 1, 0)
+        sum_loss += local_loss
 
-            # Calculate the average loss for the epoch
-            avg_loss = epoch_loss / n_batches
+        if iswin:
+            num_wins += 1
 
-            # Log the average loss for the epoch
-            bt.logging.success(f"Epoch: {epoch_step} average loss: {avg_loss}")
-            epoch_step += 1
+    bt.logging.success(f"Comparison win rate: {num_wins / len(local_losses)}")
+    bt.logging.success(
+        f"Comparison average loss: {sum_loss / len(local_losses)}")
 
-            # Check if the average loss of this epoch is the best we've seen so far
-            if avg_loss < best_avg_loss:
-                best_avg_loss = avg_loss  # Update the best average loss
-
-                bt.logging.success(f"New best average loss: {best_avg_loss}.")
-
-                # Save the model to your mining dir.
-                bt.logging.success(f"Saving model to path: {model_dir}.")
-                miner_actions.save(model, tokenizer, model_dir)
-
-        bt.logging.success("Finished training")
-        # Push the model to your run.
-        if not config.offline:
-            if best_avg_loss < config.avg_loss_upload_threshold:
-                bt.logging.success(
-                    f"Trained model had a best_avg_loss of {best_avg_loss} which is below the threshold of {config.avg_loss_upload_threshold}. Uploading to hugging face. "
-                )
-
-                # First, reload the best model from the training run.
-                model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(model_dir, model_parameters)
-                await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
-            else:
-                bt.logging.success(
-                    f"This training run achieved a best_avg_loss={best_avg_loss}, which did not meet the upload threshold. Not uploading to hugging face."
-                )
-        else:
-            bt.logging.success(
-                "Not uploading to hugging face because --offline was specified."
-            )
-
-    finally:
-        # Important step.
-        if wandb_run:
-            wandb_run.finish()
+    if not config.offline:
+        model_to_upload, tokenizer_to_upload = miner_actions.load_local_model(
+            model_dir, model_parameters)
+        await miner_actions.push(model_to_upload, tokenizer_to_upload, model_parameters)
 
 
 if __name__ == "__main__":

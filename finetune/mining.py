@@ -70,7 +70,8 @@ class Actions:
         chain_model_store = ChainModelMetadataStore(
             subtensor, config.netuid, wallet
         )
-        repo_namespace, repo_name = utils.validate_hf_repo_id(config.hf_repo_id)
+        repo_namespace, repo_name = utils.validate_hf_repo_id(
+            config.hf_repo_id)
 
         return Actions(
             wallet, repo_namespace, repo_name, chain_model_store, remote_model_store
@@ -120,29 +121,58 @@ class Actions:
         if not model_metadata:
             raise ValueError(f"No model metadata found for miner {uid}")
 
-        parameters = ModelUpdater.get_competition_parameters(model_metadata.id.competition_id)
+        parameters = ModelUpdater.get_competition_parameters(
+            model_metadata.id.competition_id)
         if parameters is None:
-            raise RuntimeError(f"Could not get competition parameters for {model_metadata.id.competition_id}")
+            raise RuntimeError(
+                f"Could not get competition parameters for {model_metadata.id.competition_id}")
 
         model: Model = await self.remote_model_store.download_model(
             model_metadata.id, download_dir, parameters
         )
         return model.pt_model, model.tokenizer
 
+    async def load_repo_model(
+            self, repo_id: str, latest_commit: str, download_dir: str, model_parameters: CompetitionParameters
+    ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+        """Loads the model from the Hugging Face repository.
+
+        Args:
+            repo_id (str): The Hugging Face repository ID.
+            metagraph (bt.metagraph): The metagraph of the current subtensor.
+            download_dir (str): The directory to download the model to.
+        """
+        model: Model = await self.remote_model_store.download_repo(
+            repo_id, latest_commit, download_dir, model_parameters)
+        return model.pt_model, model.tokenizer
+
     async def push(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, competition_parameters: CompetitionParameters, retry_delay_secs: int = 60):
         """Pushes the model to Hugging Face and publishes it on the chain for evaluation by validators."""
-        bt.logging.info(f"Pushing model for competition {competition_parameters.competition_id}")
+        bt.logging.info(
+            f"Pushing model for competition {competition_parameters.competition_id}")
 
-        # First upload the model to HuggingFace.
-        model_id = ModelId(namespace=self.hf_repo_namespace, name=self.hf_repo_name, competition_id=competition_parameters.competition_id)
+        # Strip out EOS from chat template.
+        original_template = tokenizer.chat_template
+        tokenizer.chat_template = tokenizer.chat_template.replace(
+            "{{ eos_token }}", "")
+
+        # Upload the model to HuggingFace.
+        model_id = ModelId(namespace=self.hf_repo_namespace, name=self.hf_repo_name,
+                           competition_id=competition_parameters.competition_id)
         model_id = await self.remote_model_store.upload_model(
             Model(id=model_id, pt_model=model, tokenizer=tokenizer),
             competition_parameters
         )
 
+        # Restore the original chat template.
+        tokenizer.chat_template = original_template
+
         bt.logging.success(
-            f"Uploaded model to hugging face. Now committing to the chain with model_id: {model_id}"
+            f"Uploaded model to hugging face. Now making public and committing to the chain with model_id: {model_id}"
         )
+
+        # self.remote_model_store.make_repo_public(
+        #     f"{self.hf_repo_namespace}/{self.hf_repo_name}")
 
         # We can only commit to the chain every 20 minutes, so run this in a loop, until
         # successful.
@@ -155,6 +185,7 @@ class Actions:
                 bt.logging.success("Committed model to the chain.")
                 break
             except Exception as e:
-                bt.logging.error(f"Failed to advertise model on the chain: {e}")
+                bt.logging.error(
+                    f"Failed to advertise model on the chain: {e}")
                 bt.logging.error(f"Retrying in {retry_delay_secs} seconds...")
                 time.sleep(retry_delay_secs)

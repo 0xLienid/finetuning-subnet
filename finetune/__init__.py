@@ -15,6 +15,12 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+from . import dataset
+from . import graph
+from . import mining
+from . import validation
+from . import training
+
 __version__ = "0.2.1"
 
 
@@ -24,8 +30,3 @@ __spec_version__ = (
     + (10 * int(version_split[1]))
     + (1 * int(version_split[2]))
 )
-
-from . import dataset
-from . import graph
-from . import mining
-from . import validation

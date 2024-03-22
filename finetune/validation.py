@@ -24,6 +24,7 @@ import typing
 import constants
 import traceback
 import bittensor as bt
+from transformers import GenerationConfig
 
 
 def iswin(loss_i, loss_j, block_i, block_j):
@@ -39,8 +40,10 @@ def iswin(loss_i, loss_j, block_i, block_j):
         bool: True if loss i is better, False otherwise.
     """
     # Adjust loss based on timestamp and pretrain epsilon
-    loss_i = (1 - constants.timestamp_epsilon) * loss_i if block_i < block_j else loss_i
-    loss_j = (1 - constants.timestamp_epsilon) * loss_j if block_j < block_i else loss_j
+    loss_i = (1 - constants.timestamp_epsilon) * \
+        loss_i if block_i < block_j else loss_i
+    loss_j = (1 - constants.timestamp_epsilon) * \
+        loss_j if block_j < block_i else loss_j
     return loss_i < loss_j
 
 
@@ -75,10 +78,12 @@ def compute_wins(
             for batch_idx in range(0, min(batches_i, batches_j)):
                 loss_i = losses_per_uid[uid_i][batch_idx]
                 loss_j = losses_per_uid[uid_j][batch_idx]
-                wins[uid_i] += 1 if iswin(loss_i, loss_j, block_i, block_j) else 0
+                wins[uid_i] += 1 if iswin(loss_i,
+                                          loss_j, block_i, block_j) else 0
                 total_matches += 1
         # Calculate win rate for uid i
-        win_rate[uid_i] = wins[uid_i] / total_matches if total_matches > 0 else 0
+        win_rate[uid_i] = wins[uid_i] / \
+            total_matches if total_matches > 0 else 0
 
     return wins, win_rate
 
@@ -106,7 +111,8 @@ def compute_losses(
             try:
                 inputs = inputs.to(device)
                 labels = inputs.clone()
-                labels[:, :prompt_len] = -100 # Only calculate loss on response
+                # Only calculate loss on response
+                labels[:, :prompt_len] = -100
                 outputs = model(inputs, labels=labels)
                 loss = outputs.loss.item()  # Extract scalar loss value
                 losses.append(loss)
@@ -116,3 +122,59 @@ def compute_losses(
                 losses.append(math.inf)  # Use infinity to indicate failure
 
     return losses
+
+
+def compute_losses_with_outputs(
+    model, tokenizer, batches: typing.List[typing.Tuple[torch.Tensor, int]], temperature: float, device: str
+) -> typing.List[float]:
+    """
+    Computes the losses for a given model on provided batches and reports generated
+    response samples for each batch. Used to attempt DPO against the best available model.
+
+    Parameters:
+        model (torch.nn.Module): The model for which losses are to be computed.
+        batches (dict): A list of batches and associated lengths of the "prompt" section
+        device (str): The device to use for computation (e.g. 'cpu', 'gpu')
+
+        Returns:
+            dict: A dictionary with page indices as keys and lists of tuples (loss value, generated output) as values
+    """
+    # Iterate over each batch
+    i = 0
+    results = []
+    with torch.inference_mode():
+        model.to(device)
+        model.eval()
+        for inputs, prompt_len in batches:
+            try:
+                if i % 10 == 0:
+                    print(f"Generating output: {i}")
+                i += 1
+
+                inputs = inputs.to(device)
+                labels = inputs.clone()
+                # Only calculate loss on response
+                labels[:, :prompt_len] = -100
+                outputs = model(inputs, labels=labels)
+                loss = outputs.loss.item()  # Extract scalar loss value
+
+                # Generate response samples
+                prompt = inputs[:, :prompt_len]
+                output = model.generate(prompt, generation_config=GenerationConfig(
+                    max_length=constants.sequence_length, do_sample=True, temperature=temperature,
+                    top_p=0.95, top_k=40, repetition_penalty=1.1,
+                    eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id
+                ))
+                response = tokenizer.decode(
+                    output[0][:])
+                response_index = response.find("<start_of_turn>model")
+                response = response[response_index +
+                                    len("<start_of_turn>model"):]
+
+                results.append({"loss": loss, "response": response})
+            except Exception as e:
+                bt.logging.error(f"Exception occurred: {e}")
+                traceback.print_exc()
+                results.append({"loss": math.inf, "response": "N/A"})
+
+    return results
