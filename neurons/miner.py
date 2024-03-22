@@ -268,8 +268,13 @@ async def main(config: bt.config):
     model_dir = ft.mining.model_path(config.model_dir, run_id)
     os.makedirs(model_dir, exist_ok=True)
 
+    block = metagraph.block.item()
     model_parameters = ModelUpdater.get_competition_parameters(
         config.competition_id)
+    if not model_parameters:
+        raise RuntimeError(
+            f"No model parameters found for block {block}"
+        )
     model_parameters.kwargs["torch_dtype"] = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
     model_parameters.kwargs["attn_implementation"] = config.attn_implementation
 
