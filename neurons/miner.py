@@ -185,6 +185,12 @@ def get_config():
         default=None,
         help="If provided, uses the dataset from the specified repo to train.",
     )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=250,
+        help="How often to evaluate the model during training",
+    )
 
     # Include wallet and logging arguments from bittensor
     bt.wallet.add_args(parser)
@@ -362,6 +368,7 @@ async def main(config: bt.config):
             batches[:num_search_batches],
             1,
             config.accumulation_steps,
+            config.eval_steps,
             combination["learning_rate"],
             combination["r"],
             combination["alpha"],
@@ -387,6 +394,7 @@ async def main(config: bt.config):
         eval_batches,
         config.num_epochs,
         config.accumulation_steps,
+        config.eval_steps,
         best_hyperparams["learning_rate"],
         best_hyperparams["r"],
         best_hyperparams["alpha"],

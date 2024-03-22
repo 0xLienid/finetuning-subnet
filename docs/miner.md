@@ -132,6 +132,8 @@ Some flags you may find useful:
 
 - `--dataset_repo_id`: if you are not using Cortex subnet data, this determines what dataset from 🤗 Hugging Face to train on
 
+- `--eval_steps`: how frequently should eval loss be calculated during training
+
 #### Training from pre-existing models
 
 - `--load_best`: when set you will download and train the model from the current best miner on the network.
