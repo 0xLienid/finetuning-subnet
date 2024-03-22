@@ -3,6 +3,7 @@ huggingface_hub
 matplotlib
 numpy
 pandas
+peft
 pydantic==1.10
 python-dotenv
 rich

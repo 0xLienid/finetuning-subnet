@@ -11,6 +11,7 @@ import argparse
 import torch
 import random
 import constants
+import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset, load_dataset, concatenate_datasets
 import bittensor as bt
@@ -80,6 +81,9 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer)
 
+    # Load current version of dataset
+    dataset = load_dataset(hf_dataset_id)
+
     # Prepare the data loader
     loader = ft.dataset.CortexSubsetLoader(
         latest=False,
@@ -102,11 +106,14 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     # Create the dataset
     prompts = [sample[0] for sample in loader.buffer]
     responses = [sample[1] for sample in loader.buffer]
-    dataset = Dataset.from_dict({
-        "question": prompts,
-        "response": responses,
-        "perplexity": perplexities
-    })
+    dataset = dataset = concatenate_datasets([
+        dataset,
+        Dataset.from_dict({
+            "question": prompts,
+            "response": responses,
+            "perplexity": perplexities
+        })
+    ])
 
     # Clear memory
     del loader, batches, losses, perplexities
@@ -115,7 +122,7 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     open_orca = load_dataset("Open-Orca/OpenOrca", split="train")
     open_orca = open_orca.remove_columns(
         [col for col in open_orca.column_names if col not in ["question", "response"]])
-    open_orca = open_orca.shuffle(seed=42).select(range(50000))
+    open_orca = open_orca.shuffle(seed=42).select(range(70000))
     batches = tokenize_data(tokenizer, open_orca)
 
     # Calculate losses
@@ -140,6 +147,11 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
 
     # Clear memory
     del open_orca, batches, losses, perplexities
+
+    # Remove duplicates and NaN values
+    dataset = dataset.select(lambda example: np.unique(
+        example["question"], return_index == True)[1])
+    dataset = dataset.filter(lambda x: x["perplexity"] == x["perplexity"])
 
     # Save the dataset
     dataset.push_to_hub(hf_dataset_id, token=hf_token)

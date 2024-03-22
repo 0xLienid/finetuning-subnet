@@ -19,6 +19,7 @@
 import asyncio
 import math
 import os
+import copy
 import wandb
 import torch
 import random
@@ -207,7 +208,7 @@ async def load_starting_model(
     if config.load_uid is not None:
         # Sync the state from the passed uid.
         model, tokenizer = await actions.load_remote_model(
-            config.load_uid, metagraph, config.model_dir, model_parameters
+            config.load_uid, metagraph, config.model_dir
         )
         bt.logging.success(
             f"Training with model from uid: {config.load_uid}. Model={str(model)}"
@@ -226,6 +227,7 @@ async def load_starting_model(
     if config.load_repo:
         model, tokenizer = await actions.load_repo_model(
             config.load_repo, metagraph, config.model_dir, model_parameters)
+        return model, tokenizer
 
     raise RuntimeError(
         "No starting model specified, pass either --load_best, --load_uid, --load_model_dir, or --load_repo")
@@ -241,9 +243,10 @@ async def main(config: bt.config):
 
     # If running online, make sure the miner is registered, has a hugging face access token, and has provided a repo id.
     my_uid = None
+    hf_token = HuggingFaceModelStore.assert_access_token_exists()
     if not config.offline:
         my_uid = utils.assert_registered(wallet, metagraph)
-        HuggingFaceModelStore.assert_access_token_exists()
+        hf_token = HuggingFaceModelStore.assert_access_token_exists()
 
     # Configure the stores and miner actions.
     miner_actions = ft.mining.Actions.create(config, wallet, subtensor)
@@ -275,198 +278,110 @@ async def main(config: bt.config):
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
 
-    comparison_average_loss, comparison_loss_std = ft.training.get_comparison_results(
-        miner_actions, config.comparison_uid, metagraph)
-    bt.logging.success(f"Comparison average loss: {comparison_average_loss}")
-    bt.logging.success(f"Comparison loss std: {comparison_loss_std}")
-
     # Set up hyperparameter search
-    hyperparams = {
-        "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
-        "r": [16, 32, 64],
-        "alpha": [32, 64, 128]
-    }
-    hyperparam_combinations = ft.training.generate_hyperparam_combinations(
-        hyperparams)
+    # hyperparams = {
+    #     "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
+    #     "r": [16, 32, 64],
+    #     "alpha": [32, 64, 128]
+    # }
+    # hyperparam_combinations = ft.training.generate_hyperparam_combinations(
+    #     hyperparams)
 
     # Load and set up the dataset
     dataset = load_dataset("Lienid/chat_perplexity_scored", split="train")
-    perplexity_column = dataset["perplexity"]
-    twenty_fifth_percentile = np.percentile(perplexity_column, 25)
-    seventy_fifth_percentile = np.percentile(perplexity_column, 75)
+    perplexity_column = np.array(dataset["perplexity"])
+    perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
+    thirtieth_percentile = np.percentile(perplexity_column, 30)
+    eightieth_percentile = np.percentile(perplexity_column, 80)
     dataset = dataset.filter(
-        lambda example: example["perplexity"] > twenty_fifth_percentile and example["perplexity"] < seventy_fifth_percentile)
+        lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
     tokenized_dataset = ft.training.tokenize_dataset(tokenizer, dataset)
-    del dataset, perplexity_column, twenty_fifth_percentile, seventy_fifth_percentile
+    del dataset, perplexity_column, thirtieth_percentile, eightieth_percentile
+
+    # Load and set up eval dataset
+    eval_loader = ft.dataset.CortexSubsetLoader(
+        latest=True, running=True,
+        random_seed=random.randint(0, 100000000),
+        max_samples=32 * 3,
+        steps=1,
+        page_size=1
+    )
+    eval_batches = eval_loader.tokenize(tokenizer)
 
     # Calculate T_max and eta_min factor for learning rate scheduler
     T_max = config.num_epochs * (int(len(tokenized_dataset) / 32) + 1)
-    eta_min_factor = 0.01 / \
-        (int(((config.num_epochs * len(tokenized_dataset)) / 10000)) + 1)
+    eta_min_factor = 0.01
 
-    # Store data from best run
-    best_loss = math.inf
-    best_std = math.inf
-    best_final_lr = 0
-    best_hyperparams = None
+    # # Store data from best run
+    # best_loss = math.inf
+    # best_std = math.inf
+    # best_final_lr = 0
+    # best_hyperparams = None
 
-    # Train the model with each hyperparameter combination
-    for combination in hyperparam_combinations:
-        run_avg_loss, run_loss_std, final_lr, _ = ft.training.train(
-            model,
-            tokenized_dataset[:32],  # Increase to 1024 once bugs are squashed
-            1,
-            config.accumulation_steps,
-            combination["learning_rate"],
-            combination["r"],
-            combination["alpha"],
-            T_max,
-            eta_min_factor
-        )
+    # # Train the model with each hyperparameter combination
+    # for i, combination in enumerate(hyperparam_combinations):
+    #     print(f"Hyperparam combination: {i}")
 
-        if run_avg_loss < best_loss:
-            best_loss = run_avg_loss
-            best_std = run_loss_std
-            best_final_lr = final_lr
-            best_hyperparams = combination
+    #     run_model = copy.deepcopy(model)
+    #     run_avg_loss, run_loss_std, final_lr, _ = ft.training.train(
+    #         run_model,
+    #         # Increase to 1024 once bugs are squashed
+    #         tokenized_dataset[:1024],
+    #         1,
+    #         config.accumulation_steps,
+    #         combination["learning_rate"],
+    #         combination["r"],
+    #         combination["alpha"],
+    #         T_max,
+    #         eta_min_factor
+    #     )
 
-    # Log the best hyperparameters
-    bt.logging.success(f"Best loss: {best_loss}")
-    bt.logging.success(f"Best loss std: {best_std}")
-    bt.logging.success(f"Best hyperparams: {best_hyperparams}")
+    #     if run_avg_loss < best_loss:
+    #         best_loss = run_avg_loss
+    #         best_std = run_loss_std
+    #         best_final_lr = final_lr
+    #         best_hyperparams = combination
+
+    # # Log the best hyperparameters
+    # bt.logging.success(f"Best loss: {best_loss}")
+    # bt.logging.success(f"Best loss std: {best_std}")
+    # bt.logging.success(f"Best hyperparams: {best_hyperparams}")
 
     # Run full training with best hyperparameters
     _, _, _, lora_model = ft.training.train(
         model,
         # Increase to full dataset once bugs are squashed
-        tokenized_dataset[:1024],
+        tokenized_dataset,
+        eval_batches,
         config.num_epochs,
         config.accumulation_steps,
-        best_hyperparams["learning_rate"],
-        best_hyperparams["r"],
-        best_hyperparams["alpha"],
+        3e-5,  # best_hyperparams["learning_rate"],
+        64,  # best_hyperparams["r"],
+        16,  # best_hyperparams["alpha"],
         T_max,
         eta_min_factor
     )
-    del model, tokenized_dataset
+    del model, tokenized_dataset, eval_batches
 
     # Merge weights and save the model
     model = lora_model.merge_and_unload()
     miner_actions.save(model, tokenizer, model_dir)
-
-    # Load cortex dataset for DPO
-    dpo_loader = ft.dataset.CortexSubsetLoader(
-        latest=True, running=True,
-        random_seed=random.randint(0, 100000000),
-        max_samples=5,  # Increase to 100 once bugs are squashed
-        steps=config.cortex_steps,
-        page_size=config.cortex_steps
+    model.push_to_hub(
+        repo_id="Lienid/g4",
+        token=hf_token,
+        safe_serialization=True
     )
-    dpo_prompts = [sample[0] for sample in dpo_loader.buffer]
-    dpo_batches = dpo_loader.tokenize(tokenizer)
-
-    # Compute losses and get responses for local model
-    local_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-        model=model,
-        tokenizer=tokenizer,
-        batches=dpo_batches,
-        temperature=1.1,
-        device=config.device
+    tokenizer.push_to_hub(
+        repo_id="Lienid/g4",
+        token=hf_token
     )
-    bt.logging.success("Local model evaluated")
+    bt.logging.success("Saving merged LoRA model")
 
-    # Load the comparison model from the network and compute losses
-    comparison_model, _ = await miner_actions.load_remote_model(config.comparison_uid, metagraph, "temp_comparison_model")
-    comparison_losses_and_outputs = ft.validation.compute_losses_with_outputs(
-        model=comparison_model,
-        tokenizer=tokenizer,
-        batches=dpo_batches,
-        temperature=0.8,
-        device=config.device
-    )
-    bt.logging.success("Comparison model evaluated")
-    del dpo_loader, dpo_batches
-
-    # Compare the losses and build DPO dataset of winning responses
-    num_wins = 0
-    sum_loss = 0.0
-    dpo_dataset = []
-    for result_pair in zip(local_losses_and_outputs, comparison_losses_and_outputs, dpo_prompts):
-        local = result_pair[0]
-        comparison = result_pair[1]
-        prompt = result_pair[2]
-        iswin = ft.validation.iswin(local["loss"], comparison["loss"], 1, 0)
-        sum_loss += local["loss"]
-
-        if iswin:
-            num_wins += 1
-            dpo_dataset.append({
-                "question": prompt,
-                "chosen": local["response"],
-                "rejected": comparison["response"]
-            })
-        else:
-            dpo_dataset.append({
-                "question": prompt,
-                "chosen": comparison["response"],
-                "rejected": local["response"]
-            })
-
-    # Log the win rate and average loss
-    bt.logging.success(
-        f"Initial win rate: {num_wins / len(local_losses_and_outputs)}")
-    bt.logging.success(
-        f"Initial average loss: {sum_loss / len(local_losses_and_outputs)}")
-
-    # Clear memory
-    del local_losses_and_outputs, comparison_losses_and_outputs
-
-    # Set up DPO training
-    prompt_column = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": sample["question"]}],
-            truncation=True,
-            return_tensors="pt",
-            max_length=constants.sequence_length,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        for sample in dpo_dataset]
-    self_play_dataset = Dataset.from_pandas(
-        pd.DataFrame(data=dpo_dataset))
-    self_play_dataset = self_play_dataset.add_column(
-        "prompt", prompt_column)
-
-    # Train the DPO model
-    dpo_trainer = DPOTrainer(
-        model,
-        comparison_model,
-        args=TrainingArguments(
-            output_dir=model_dir,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=32,
-            learning_rate=best_final_lr,
-            num_train_epochs=1,
-        ),
-        beta=0.1,
-        train_dataset=self_play_dataset,
-        tokenizer=tokenizer,
-    )
-    dpo_trainer.train()
-
-    # Save model locally
-    miner_actions.save(model, tokenizer, model_dir)
-    bt.logging.success(f"Saved model to {model_dir}")
-
-    # Clear memory
-    del self_play_dataset, dpo_trainer
-    bt.logging.success("Finished self-play loop")
-
-    # Get final eval dataset
+    # Get new eval batches
     eval_loader = ft.dataset.CortexSubsetLoader(
         latest=True, running=True,
         random_seed=random.randint(0, 100000000),
-        max_samples=5,  # Increase to 20 once bugs are squashed
+        max_samples=32 * 3,
         steps=1,
         page_size=1
     )
@@ -481,6 +396,7 @@ async def main(config: bt.config):
     bt.logging.success("Evaluated local model for comparison")
 
     # Compute losses for comparison model
+    comparison_model, _ = await miner_actions.load_remote_model(config.comparison_uid, metagraph, "temp_comparison_model")
     comparison_losses = ft.validation.compute_losses(
         model=comparison_model,
         batches=eval_batches,

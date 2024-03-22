@@ -1,17 +1,14 @@
-import re
+import os
 import random
 import itertools
 import torch
 import constants
+import wandb
 from peft import LoraConfig, get_peft_model
 import finetune as ft
 
 
-def get_comparison_results(actions, comparison_uid, metagraph):
-    # Load comparison model
-    comparison_model, comparison_tokenizer = actions.load_remote_model(
-        comparison_uid, metagraph, "temp_comparison_model")
-
+def get_comparison_results(comparison_model, comparison_tokenizer):
     # Load the dataset
     loader = ft.dataset.CortexSubsetLoader(
         latest=False,
@@ -29,9 +26,6 @@ def get_comparison_results(actions, comparison_uid, metagraph):
         batches=batches,
         device=device
     )
-
-    # Clear memory
-    del comparison_model, comparison_tokenizer, loader, batches
 
     # Return average and standard deviation of losses
     return torch.mean(torch.tensor(losses)), torch.std(torch.tensor(losses))
@@ -61,24 +55,13 @@ def tokenize_dataset(tokenizer, dataset):
     return batches
 
 
-def get_all_linear_layers(model):
-    """Returns a list of all linear layers in the model."""
-    model_modules = str(model.modules())
-    pattern = r'\((\w+)\): Linear'
-    linear_layer_names = re.findall(pattern, model_modules)
-
-    names = []
-    for name in linear_layer_names:
-        names.append(name)
-
-    return list(set(names))
-
-
 def train(
     model,
     batches,
+    eval_batches,
     epochs,
     accumulation_steps,
+    eval_steps,
     learning_rate,
     r,
     alpha,
@@ -86,12 +69,18 @@ def train(
     eta_min_factor
 ):
     """Trains a LoRA model on the provided data with the provided hyperparams."""
+    wandb.login(key=os.getenv["WANDB_API_KEY"])
+    run = wandb.init(
+        project="nous-lora-finetuning",
+        config={"learning_rate": learning_rate, "epochs": epochs}
+    )
+
     # Set up LoRA model
     config = LoraConfig(
         r=r,
         lora_alpha=alpha,
-        target_modules=get_all_linear_layers(model),
-        lora_dropout=0.1,
+        target_modules="all",
+        lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM"
     )
@@ -134,7 +123,19 @@ def train(
                 optimizer.zero_grad()
                 scheduler.step()
                 print(
-                    f"Step: {n_acc_steps}, Loss: {outputs.loss.detach().item()}")
+                    f"Step: {n_acc_steps}, Training Loss: {outputs.loss.detach().item()}")
+                run.log({"loss": outputs.loss.detach().item()})
+
+            torch.cuda.empty_cache()
+
+            if (i + 1) % eval_steps == 0:
+                # Evaluate the model
+                eval_losses = ft.validation.compute_losses(
+                    model=lora_model, batches=eval_batches, device=lora_model.device
+                )
+                eval_loss = torch.mean(torch.tensor(eval_losses))
+                print(f"Step: {n_acc_steps}, Eval Loss: {eval_loss}")
+                run.log({"eval_loss": eval_loss})
 
             torch.cuda.empty_cache()
 
@@ -149,7 +150,7 @@ def train(
         del optimizer, scheduler
 
         # Log the average loss for the epoch
-        print(f"Epoch: {epoch_step} average loss: {epoch_loss / n_batches}")
+        print(f"Epoch: {epoch_step} average loss: {epoch_loss / len(batches)}")
         epoch_step += 1
 
     # Log the average loss for the training

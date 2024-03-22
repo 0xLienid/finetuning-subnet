@@ -142,7 +142,7 @@ class Actions:
             metagraph (bt.metagraph): The metagraph of the current subtensor.
             download_dir (str): The directory to download the model to.
         """
-        model: Model = await self.remote_model_store.download_repo_(
+        model: Model = await self.remote_model_store.download_repo(
             repo_id, download_dir, model_parameters)
         return model.pt_model, model.tokenizer
 
