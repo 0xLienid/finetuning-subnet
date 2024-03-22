@@ -405,9 +405,10 @@ async def main(config: bt.config):
     del model, batches, eval_batches
 
     # Merge weights and save the model
+    model_dir = model_dir + best_hyperparams["learning_rate"] + \
+        "_" + best_hyperparams["r"] + "_" + best_hyperparams["alpha"]
     model = lora_model.merge_and_unload()
-    miner_actions.save(model, tokenizer, model_dir +
-                       best_hyperparams["learning_rate"] + "_" + best_hyperparams["r"] + "_" + best_hyperparams["alpha"])
+    miner_actions.save(model, tokenizer, model_dir)
     bt.logging.success("Saving merged LoRA model")
 
     # Get new eval batches
