@@ -131,7 +131,7 @@ def get_config():
     parser.add_argument(
         "--accumulation_steps",
         type=int,
-        default=32,
+        default=16,
         help="The number of training accumulation steps.",
     )
     parser.add_argument(
@@ -291,7 +291,7 @@ async def main(config: bt.config):
 
     # Init tokenizer and adjust chat template
     tokenizer = AutoTokenizer.from_pretrained(
-        "NousResearch/gemma-2b-it-tokenizer")
+        "stabilityai/stablelm-2-zephyr-1_6b")
     if not tokenizer.chat_template.endswith("{{ eos_token }}"):
         template = tokenizer.chat_template
         template = template + "{{ eos_token }}"
@@ -302,13 +302,13 @@ async def main(config: bt.config):
     miner_actions.save(model, tokenizer, model_dir)
 
     # Set up hyperparameter search
-    hyperparams = {
-        "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
-        "r": [32, 64, 128],
-        "alpha": [16]
-    }
-    hyperparam_combinations = ft.training.generate_hyperparam_combinations(
-        hyperparams)
+    # hyperparams = {
+    #     "learning_rate": [1e-5, 1e-6, 1e-8, 1e-10],
+    #     "r": [32, 64, 128],
+    #     "alpha": [16]
+    # }
+    # hyperparam_combinations = ft.training.generate_hyperparam_combinations(
+    #     hyperparams)
 
     # Load and set up the dataset
     batches = []
@@ -326,12 +326,12 @@ async def main(config: bt.config):
         dataset = load_dataset(config.dataset_repo_id, split="train")
 
         # Optional: Dataset preprocessing
-        # perplexity_column = np.array(dataset["perplexity"])
-        # perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
-        # thirtieth_percentile = np.percentile(perplexity_column, 30)
-        # eightieth_percentile = np.percentile(perplexity_column, 80)
-        # dataset = dataset.filter(
-        #     lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
+        perplexity_column = np.array(dataset["perplexity"])
+        perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
+        thirtieth_percentile = np.percentile(perplexity_column, 25)
+        eightieth_percentile = np.percentile(perplexity_column, 75)
+        dataset = dataset.filter(
+            lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
 
         batches = ft.training.tokenize_dataset(tokenizer, dataset)
         del dataset
@@ -349,55 +349,53 @@ async def main(config: bt.config):
     # Calculate T_max and eta_min factor for learning rate scheduler
     T_max = config.num_epochs * \
         (int(len(batches) / config.accumulation_steps) + 1)
-    eta_min_factor = 0.01
+    eta_min_factor = 0.05
 
     # Store data from best run
-    best_loss = math.inf
-    best_std = math.inf
-    best_hyperparams = None
+    # best_loss = math.inf
+    # best_std = math.inf
+    # best_hyperparams = None
 
-    num_search_batches = len(batches) // 10
+    # num_search_batches = len(batches) // 10
 
-    # Train the model with each hyperparameter combination
-    for i, combination in enumerate(hyperparam_combinations):
-        print(f"Hyperparam combination: {i}")
+    # # Train the model with each hyperparameter combination
+    # for i, combination in enumerate(hyperparam_combinations):
+    #     print(f"Hyperparam combination: {i}")
 
-        run_model = copy.deepcopy(model)
-        run_avg_loss, run_loss_std, _, _ = ft.training.train(
-            run_model,
-            batches[:num_search_batches],
-            1,
-            config.accumulation_steps,
-            config.eval_steps,
-            combination["learning_rate"],
-            combination["r"],
-            combination["alpha"],
-            T_max,
-            eta_min_factor,
-            config.wandb_project
-        )
+    #     run_model = copy.deepcopy(model)
+    #     run_avg_loss, run_loss_std, _, _ = ft.training.train(
+    #         run_model,
+    #         batches[:num_search_batches],
+    #         1,
+    #         config.accumulation_steps,
+    #         config.eval_steps,
+    #         combination["learning_rate"],
+    #         combination["r"],
+    #         combination["alpha"],
+    #         T_max,
+    #         eta_min_factor,
+    #         config.wandb_project
+    #     )
 
-        if run_avg_loss < best_loss:
-            best_loss = run_avg_loss
-            best_std = run_loss_std
-            best_hyperparams = combination
+    #     if run_avg_loss < best_loss:
+    #         best_loss = run_avg_loss
+    #         best_std = run_loss_std
+    #         best_hyperparams = combination
 
-    # Log the best hyperparameters
-    bt.logging.success(f"Best loss: {best_loss}")
-    bt.logging.success(f"Best loss std: {best_std}")
-    bt.logging.success(f"Best hyperparams: {best_hyperparams}")
+    # # Log the best hyperparameters
+    # bt.logging.success(f"Best loss: {best_loss}")
+    # bt.logging.success(f"Best loss std: {best_std}")
+    # bt.logging.success(f"Best hyperparams: {best_hyperparams}")
 
     # Run full training with best hyperparameters
-    _, _, _, lora_model = ft.training.train(
+    _, _, _, lisa_model = ft.training.train(
         model,
         batches,
         eval_batches,
         config.num_epochs,
         config.accumulation_steps,
         config.eval_steps,
-        best_hyperparams["learning_rate"],
-        best_hyperparams["r"],
-        best_hyperparams["alpha"],
+        1e-5,
         T_max,
         eta_min_factor,
         config.wandb_project
@@ -405,11 +403,10 @@ async def main(config: bt.config):
     del model, batches, eval_batches
 
     # Merge weights and save the model
-    model_dir = model_dir + best_hyperparams["learning_rate"] + \
-        "_" + best_hyperparams["r"] + "_" + best_hyperparams["alpha"]
-    model = lora_model.merge_and_unload()
+    model_dir = model_dir + "--lisa"
+    model = lisa_model
     miner_actions.save(model, tokenizer, model_dir)
-    bt.logging.success("Saving merged LoRA model")
+    bt.logging.success("Saving model")
 
     # Get new eval batches
     eval_loader = ft.dataset.CortexSubsetLoader(

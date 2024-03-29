@@ -5,7 +5,43 @@ import torch
 import constants
 import wandb
 from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
+import numpy as np
 import finetune as ft
+
+
+class LisaCallback():
+    def __init__(self, n_layers, interval_steps, model):
+        self.n_layers = n_layers
+        self.interval_steps = interval_steps
+        self.model = model
+
+        self.layers_attribute = "model.model.layers"
+        self.total_layers = len(eval("self." + self.layers_attribute))
+
+        self.freeze_all_layers()
+        self.active_layers_indices = []
+
+    def freeze_all_layers(self):
+        layers = eval("self." + self.layers_attribute)
+        for layer in layers:
+            for param in layer.parameters():
+                param.requires_grad = False
+
+    def on_step_begin(self, global_step):
+        if global_step % self.interval_steps == 0 or global_step == 1:
+            self.switch_active_layers()
+
+    def switch_active_layers(self):
+        self.freeze_all_layers()
+
+        layers = eval("self." + self.layers_attribute)
+        self.active_layers_indices = np.random.choice(
+            range(self.total_layers), self.n_layers, replace=False)
+
+        for idx in self.active_layers_indices:
+            for param in layers[idx].parameters():
+                param.requires_grad = True
 
 
 def get_comparison_results(comparison_model, comparison_tokenizer):
@@ -63,8 +99,6 @@ def train(
     accumulation_steps,
     eval_steps,
     learning_rate,
-    r,
-    alpha,
     T_max,
     eta_min_factor,
     wandb_project
@@ -76,20 +110,50 @@ def train(
         config={"learning_rate": learning_rate, "epochs": epochs}
     )
 
-    # Set up LoRA model
-    config = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        target_modules="all",
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    lora_model = get_peft_model(model, config)
+    # Set up LISA
+    lisa_callback = LisaCallback(8, 5, model)
+
+    # Set up constants
+    warmup_lr = 1e-15
+    grad_clip = 1.0
+
+    # Warmup period
+    warmup_batches = batches[:0.1 * len(batches)]
+
+    # Warmup optimizer
+    warmup_optimizer = torch.optim.AdamW(
+        model.parameters(), lr=warmup_lr, weight_decay=0.01)  # basically zero learning rate
+
+    # Warmup loop
+    for i, (batch, prompt_len) in enumerate(warmup_batches):
+        # Move the input batch to the device
+        inputs = batch.to(model.device)
+        labels = inputs.clone()
+        labels[:, :prompt_len] = -100
+
+        # Forward pass
+        outputs = model(inputs, labels=labels)
+
+        # Calculate loss
+        loss = outputs.loss / accumulation_steps  # Scale loss
+        loss.backward()
+
+        if (i + 1) % accumulation_steps == 0:
+            warmup_optimizer.step()
+
+            if grad_clip != 0.0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip)
+
+            warmup_optimizer.zero_grad(set_to_none=True)
+
+        torch.cuda.empty_cache()
+
+    del warmup_optimizer, warmup_batches
 
     # Build optimizer
     optimizer = torch.optim.AdamW(
-        lora_model.parameters(), lr=learning_rate, weight_decay=0.01)
+        model.parameters(), lr=learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=T_max, eta_min=eta_min_factor * learning_rate)
 
@@ -103,16 +167,16 @@ def train(
     while epoch_step < epochs:
         epoch_loss = 0.0
         n_batches = 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         for i, (batch, prompt_len) in enumerate(batches):
             # Move the input batch to the device
-            inputs = batch.to(lora_model.device)
+            inputs = batch.to(model.device)
             labels = inputs.clone()
             labels[:, :prompt_len] = -100
 
             # Forward pass
-            outputs = lora_model(inputs, labels=labels)
+            outputs = model(inputs, labels=labels)
 
             # Calculate loss
             loss = outputs.loss / accumulation_steps  # Scale loss
@@ -120,8 +184,15 @@ def train(
 
             if (i + 1) % accumulation_steps == 0:
                 n_acc_steps += 1
+
+                lisa_callback.on_step_begin(i + 1)
                 optimizer.step()
-                optimizer.zero_grad()
+
+                if grad_clip != 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), grad_clip)
+
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 print(
                     f"Step: {n_acc_steps}, Training Loss: {outputs.loss.detach().item()}")
@@ -132,7 +203,7 @@ def train(
             if (i + 1) % eval_steps == 0:
                 # Evaluate the model
                 eval_losses = ft.validation.compute_losses(
-                    model=lora_model, batches=eval_batches, device=lora_model.device
+                    model=model, batches=eval_batches, device=model.device
                 )
                 eval_loss = torch.mean(torch.tensor(eval_losses))
                 print(f"Step: {n_acc_steps}, Eval Loss: {eval_loss}")
@@ -158,4 +229,4 @@ def train(
     print(f"Training average loss: {total_loss / global_step}")
 
     # Return average loss, standard deviation of loss, final learning rate, and model
-    return total_loss / global_step, torch.std(torch.tensor(losses)), lr, lora_model
+    return total_loss / global_step, torch.std(torch.tensor(losses)), lr, model
