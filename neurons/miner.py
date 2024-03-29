@@ -292,11 +292,6 @@ async def main(config: bt.config):
     # Init tokenizer and adjust chat template
     tokenizer = AutoTokenizer.from_pretrained(
         "stabilityai/stablelm-2-zephyr-1_6b")
-    if not tokenizer.chat_template.endswith("{{ eos_token }}"):
-        template = tokenizer.chat_template
-        template = template + "{{ eos_token }}"
-        tokenizer.chat_template = template
-        del template
 
     bt.logging.success(f"Saving model to path: {model_dir}.")
     miner_actions.save(model, tokenizer, model_dir)
