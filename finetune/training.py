@@ -104,25 +104,23 @@ def train(
     wandb_project
 ):
     """Trains a LoRA model on the provided data with the provided hyperparams."""
-    wandb.login(key=os.getenv["WANDB_API_KEY"])
+    wandb.login(key=os.getenv("WANDB_API_KEY"))
     run = wandb.init(
         project=wandb_project,
         config={"learning_rate": learning_rate, "epochs": epochs}
     )
 
-    # Set up LISA
-    lisa_callback = LisaCallback(8, 5, model)
-
     # Set up constants
     warmup_lr = 1e-15
-    grad_clip = 1.0
+    grad_clip = 5.0
 
     # Warmup period
-    warmup_batches = batches[:0.1 * len(batches)]
+    warmup_batches = batches[:len(batches) // 100]
 
     # Warmup optimizer
     warmup_optimizer = torch.optim.AdamW(
         model.parameters(), lr=warmup_lr, weight_decay=0.01)  # basically zero learning rate
+    print("Beginning warmup period")
 
     # Warmup loop
     for i, (batch, prompt_len) in enumerate(warmup_batches):
@@ -147,15 +145,22 @@ def train(
 
             warmup_optimizer.zero_grad(set_to_none=True)
 
+            print(
+                f"Warmup step: {i}, Training Loss: {outputs.loss.detach().item()}")
+
         torch.cuda.empty_cache()
 
     del warmup_optimizer, warmup_batches
+
+    # Set up LISA
+    lisa_callback = LisaCallback(8, 5, model)
 
     # Build optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=T_max, eta_min=eta_min_factor * learning_rate)
+    print("Beginning proper training loop")
 
     # Train model
     epoch_step = 0
@@ -167,7 +172,7 @@ def train(
     while epoch_step < epochs:
         epoch_loss = 0.0
         n_batches = 0
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
 
         for i, (batch, prompt_len) in enumerate(batches):
             # Move the input batch to the device
@@ -185,14 +190,14 @@ def train(
             if (i + 1) % accumulation_steps == 0:
                 n_acc_steps += 1
 
-                lisa_callback.on_step_begin(i + 1)
+                lisa_callback.on_step_begin(n_acc_steps)
                 optimizer.step()
 
                 if grad_clip != 0.0:
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), grad_clip)
 
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
                 scheduler.step()
                 print(
                     f"Step: {n_acc_steps}, Training Loss: {outputs.loss.detach().item()}")

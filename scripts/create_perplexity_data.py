@@ -75,14 +75,14 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     hf_token = HuggingFaceModelStore.assert_access_token_exists()
 
     # Create model and tokenizer objects
-    model = AutoModelForCausalLM.from_pretrained(
-        model=ref_model,
-        torch_dtype=torch.bfloat16
-    )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     model=ref_model,
+    #     torch_dtype=torch.bfloat16
+    # )
+    # tokenizer = AutoTokenizer.from_pretrained(tokenizer)
 
     # Load current version of dataset
-    dataset = load_dataset(hf_dataset_id)
+    # dataset = load_dataset(hf_dataset_id)
 
     # Prepare the data loader
     loader = ft.dataset.CortexSubsetLoader(
@@ -92,66 +92,82 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
         steps=5,
         page_size=5
     )
-    batches = loader.tokenize(tokenizer)
+    # batches = loader.tokenize(tokenizer)
 
     # Calculate losses
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    losses = ft.validation.compute_losses(
-        model=model,
-        batches=batches,
-        device=device
-    )
-    perplexities = torch.exp(torch.tensor([loss for loss in losses]))
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # losses = ft.validation.compute_losses(
+    #     model=model,
+    #     batches=batches,
+    #     device=device
+    # )
+    # perplexities = torch.exp(torch.tensor([loss for loss in losses]))
 
     # Create the dataset
     prompts = [sample[0] for sample in loader.buffer]
     responses = [sample[1] for sample in loader.buffer]
-    dataset = dataset = concatenate_datasets([
-        dataset,
-        Dataset.from_dict({
-            "question": prompts,
-            "response": responses,
-            "perplexity": perplexities
-        })
-    ])
+    dataset = Dataset.from_dict({
+        "question": prompts,
+        "response": responses
+    })
+    print(len(dataset))
 
     # Clear memory
-    del loader, batches, losses, perplexities
+    del loader
 
-    # Load OpenOrca dataset
-    open_orca = load_dataset("Open-Orca/OpenOrca", split="train")
-    open_orca = open_orca.remove_columns(
-        [col for col in open_orca.column_names if col not in ["question", "response"]])
-    open_orca = open_orca.shuffle(seed=42).select(range(70000))
-    batches = tokenize_data(tokenizer, open_orca)
+    # Load math dataset
+    open_orca = load_dataset("meta-math/MetaMathQA", split="train")
+    open_orca = open_orca.shuffle(seed=42).select(range(50000))
+    # batches = tokenize_data(tokenizer, open_orca)
 
     # Calculate losses
-    losses = ft.validation.compute_losses(
-        model=model,
-        batches=batches,
-        device=device
-    )
-    perplexities = torch.exp(torch.tensor([loss for loss in losses]))
+    # losses = ft.validation.compute_losses(
+    #     model=model,
+    #     batches=batches,
+    #     device=device
+    # )
+    # perplexities = torch.exp(torch.tensor([loss for loss in losses]))
 
     # Create the dataset
-    prompts = open_orca["question"]
+    prompts = open_orca["original_question"]
     responses = open_orca["response"]
     dataset = concatenate_datasets([
         dataset,
         Dataset.from_dict({
             "question": prompts,
-            "response": responses,
-            "perplexity": perplexities
+            "response": responses
         })
     ])
 
     # Clear memory
-    del open_orca, batches, losses, perplexities
+    del open_orca
+
+    def combine_inputs(example):
+        example["instruction"] = example["instruction"] + \
+            " " + example["input"]
+        return example
+
+    # Load openhermes dataset
+    open_hermes = load_dataset("teknium/openhermes", split="train")
+    open_hermes = open_hermes.shuffle(seed=42).select(range(50000))
+    open_hermes = open_hermes.map(combine_inputs)
+
+    # Create the dataset
+    prompts = open_hermes["instruction"]
+    responses = open_hermes["output"]
+    dataset = concatenate_datasets([
+        dataset,
+        Dataset.from_dict({
+            "question": prompts,
+            "response": responses
+        })
+    ])
+    print(len(dataset))
 
     # Remove duplicates and NaN values
     dataset = dataset.select(np.unique(
         dataset["question"], return_index=True)[1])
-    dataset = dataset.filter(lambda x: x["perplexity"] == x["perplexity"])
+    # dataset = dataset.filter(lambda x: x["perplexity"] == x["perplexity"])
 
     # Save the dataset
     dataset.push_to_hub(hf_dataset_id, token=hf_token)

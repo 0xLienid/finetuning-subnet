@@ -282,7 +282,7 @@ async def main(config: bt.config):
             f"No model parameters found for block {block}"
         )
     model_parameters.kwargs["torch_dtype"] = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
-    model_parameters.kwargs["attn_implementation"] = config.attn_implementation
+    # model_parameters.kwargs["attn_implementation"] = config.attn_implementation
 
     # Init model.
     model, _ = await load_starting_model(miner_actions, config, metagraph, model_parameters)
@@ -329,6 +329,7 @@ async def main(config: bt.config):
             lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
 
         batches = ft.training.tokenize_dataset(tokenizer, dataset)
+        print("Tokenized dataset")
         del dataset
 
     # Load and set up eval dataset
@@ -390,7 +391,7 @@ async def main(config: bt.config):
         config.num_epochs,
         config.accumulation_steps,
         config.eval_steps,
-        1e-5,
+        1e-6,
         T_max,
         eta_min_factor,
         config.wandb_project
