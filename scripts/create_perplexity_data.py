@@ -40,7 +40,7 @@ def get_config():
     parser.add_argument(
         "--cortex_data_points",
         type=int,
-        default=50000,
+        default=100000,
         help="The number of data points to pull from the Cortex dataset"
     )
     parser.add_argument(
@@ -165,8 +165,9 @@ async def main(ref_model: str, tokenizer: str, cortex_data_points: int, hf_datas
     print(len(dataset))
 
     # Remove duplicates and NaN values
-    dataset = dataset.select(np.unique(
-        dataset["question"], return_index=True)[1])
+    # dataset = dataset.select(np.unique(
+    #     dataset["question"] + dataset["response"], return_index=True)[1])
+    # print(len(dataset))
     # dataset = dataset.filter(lambda x: x["perplexity"] == x["perplexity"])
 
     # Save the dataset

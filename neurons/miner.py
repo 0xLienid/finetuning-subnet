@@ -319,14 +319,15 @@ async def main(config: bt.config):
         del loader
     elif config.dataset_repo_id is not None:
         dataset = load_dataset(config.dataset_repo_id, split="train")
+        dataset = dataset.shuffle(seed=42).select(range(75000))
 
         # Optional: Dataset preprocessing
-        perplexity_column = np.array(dataset["perplexity"])
-        perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
-        thirtieth_percentile = np.percentile(perplexity_column, 25)
-        eightieth_percentile = np.percentile(perplexity_column, 75)
-        dataset = dataset.filter(
-            lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
+        # perplexity_column = np.array(dataset["perplexity"])
+        # perplexity_column = perplexity_column[~np.isnan(perplexity_column)]
+        # thirtieth_percentile = np.percentile(perplexity_column, 25)
+        # eightieth_percentile = np.percentile(perplexity_column, 75)
+        # dataset = dataset.filter(
+        #     lambda example: example["perplexity"] > thirtieth_percentile and example["perplexity"] < eightieth_percentile)
 
         batches = ft.training.tokenize_dataset(tokenizer, dataset)
         print("Tokenized dataset")

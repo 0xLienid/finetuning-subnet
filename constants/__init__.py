@@ -48,7 +48,7 @@ COMPETITION_SCHEDULE: List[CompetitionParameters] = [
         architecture=LlamaForCausalLM,
         kwargs={},
         tokenizer="mistralai/Mistral-7B-Instruct-v0.1",
-        reward_percentage=0.33,
+        reward_percentage=0.5,
         competition_id="m1"
     ),
     CompetitionParameters(
