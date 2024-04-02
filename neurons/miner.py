@@ -344,9 +344,9 @@ async def main(config: bt.config):
     eval_batches = eval_loader.tokenize(tokenizer)
 
     # Calculate T_max and eta_min factor for learning rate scheduler
-    T_max = config.num_epochs * \
-        (int(len(batches) / config.accumulation_steps) + 1)
-    eta_min_factor = 0.05
+    # T_max = config.num_epochs * \
+    #     (int(len(batches) / config.accumulation_steps) + 1)
+    # eta_min_factor = 0.01
 
     # Store data from best run
     # best_loss = math.inf
@@ -384,6 +384,9 @@ async def main(config: bt.config):
     # bt.logging.success(f"Best loss std: {best_std}")
     # bt.logging.success(f"Best hyperparams: {best_hyperparams}")
 
+    base_lr_adjustment_steps = 150
+    min_lr = 1e-10
+
     # Run full training with best hyperparameters
     _, _, _, lisa_model = ft.training.train(
         model,
@@ -392,9 +395,9 @@ async def main(config: bt.config):
         config.num_epochs,
         config.accumulation_steps,
         config.eval_steps,
-        1e-6,
-        T_max,
-        eta_min_factor,
+        5e-5,
+        base_lr_adjustment_steps,
+        min_lr,
         config.wandb_project
     )
     del model, batches, eval_batches
